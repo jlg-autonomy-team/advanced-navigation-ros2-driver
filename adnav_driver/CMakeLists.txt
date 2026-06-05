@@ -99,7 +99,13 @@ install(
 
 if(BUILD_TESTING)
   find_package(ament_cmake_cpplint REQUIRED)
-  ament_cpplint()
+  ament_cpplint(
+    FILTERS
+      "-build/include_subdir"    # headers are included by filename, not subdir path
+      "-whitespace/blank_line"   # redundant blank lines at end of blocks
+      "-whitespace/ending_newline" # missing newline at end of file
+      "-whitespace/tab"          # existing code uses tabs in some files
+  )
 endif()
 
 ament_export_include_directories(include)
