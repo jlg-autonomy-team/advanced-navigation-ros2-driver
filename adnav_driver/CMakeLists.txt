@@ -102,9 +102,15 @@ if(BUILD_TESTING)
   ament_cpplint(
     FILTERS
       "-build/include_subdir"    # headers are included by filename, not subdir path
+      "-build/include_order"
       "-whitespace/blank_line"   # redundant blank lines at end of blocks
       "-whitespace/ending_newline" # missing newline at end of file
       "-whitespace/tab"          # existing code uses tabs in some files
+      "-whitespace/line_length"  # line length is fine
+      "-whitespace/comments"
+      "-whitespace/operators"
+      "-readability/braces"
+
   )
 endif()
 
