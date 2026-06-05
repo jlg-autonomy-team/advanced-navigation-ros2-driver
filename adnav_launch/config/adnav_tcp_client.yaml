@@ -17,10 +17,14 @@ adnav_node:
     com_port: ""
 
     ################ IP Communication Parameters
-    # IP of the Advanced Navigation Device. 
+    # IP of the Advanced Navigation Device.
     ip_address: "192.168.4.10" # only required if comm_select = 1
-    # Port to communicate over. 
-    port: 16724
+    # TCP port. Standard AN mapping for the device's primary Ethernet
+    # interface is 16718; ports 16719..16722 correspond to Ethernet 2..5
+    # on devices that expose multiple. Some products (e.g. GNSS Compass)
+    # only enable a non-primary port out of the box - check the device's
+    # network configuration if 16718 is refused.
+    port: 16718
 
     # This is the minimum period for reading and publishing data.
     # Warning on some systems this is performance limited.  
@@ -40,7 +44,7 @@ adnav_node:
     #   Freq = 1000000/(Period * Packet Timer Period)
     #   e.g. 10,000 μs Period length and 10 periods per packet gives 10Hz
     # e.g. Requesting Packet 20 with a period of 50 is [20,50]
-    packet_request: [20, 1, 28, 1]
+    packet_request: [20, 1, 28, 1, 26, 1]
     
     # The size of the packet period in Microseconds. 
     # Bounded to [1000-65535] [1000Hz-15.29Hz]

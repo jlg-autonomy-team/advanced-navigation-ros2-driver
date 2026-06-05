@@ -57,8 +57,6 @@ jobs:
     runs-on: ubuntu-22.04
     container:
       image: ros:humble-ros-base
-    needs: build
-
     steps:
       - uses: actions/checkout@v6
         with:
