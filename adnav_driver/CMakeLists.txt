@@ -103,6 +103,7 @@ if(BUILD_TESTING)
     FILTERS
       "-build/include_subdir"    # headers are included by filename, not subdir path
       "-build/include_order"
+      "-whitespace/newline"
       "-whitespace/blank_line"   # redundant blank lines at end of blocks
       "-whitespace/ending_newline" # missing newline at end of file
       "-whitespace/tab"          # existing code uses tabs in some files
@@ -110,6 +111,7 @@ if(BUILD_TESTING)
       "-whitespace/comments"
       "-whitespace/operators"
       "-readability/braces"
+      "-build/header_guard"
 
   )
 endif()

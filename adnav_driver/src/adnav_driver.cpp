@@ -125,8 +125,8 @@ void Driver::waitForDevicePacket() {
 	int bytes_received;
 
 	RCLCPP_INFO(this->get_logger(),
-		"Waiting for device-information reply (timeout %lds)...",
-		static_cast<long>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()));
+		"Waiting for device-information reply (timeout %llds)...",
+		WAIT_FOR_DEVICE_INFO_TIMEOUT.count());
 
 	const auto deadline = std::chrono::steady_clock::now() + WAIT_FOR_DEVICE_INFO_TIMEOUT;
 	auto next_request_at = std::chrono::steady_clock::now();
@@ -158,12 +158,12 @@ void Driver::waitForDevicePacket() {
 					transport_hint = "(unknown transport)";
 					break;
 			}
-			RCLCPP_ERROR(this->get_logger(),
-				"Timed out after %lds waiting for the device to reply with a "
-				"DeviceInformation packet. Transport: %s. Check that the device "
-				"is powered, connected, and configured to talk over this transport.",
-				static_cast<long>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()),
-				transport_hint.c_str());
+		RCLCPP_ERROR(this->get_logger(),
+			"Timed out after %llds waiting for the device to reply with a "
+			"DeviceInformation packet. Transport: %s. Check that the device "
+			"is powered, connected, and configured to talk over this transport.",
+			WAIT_FOR_DEVICE_INFO_TIMEOUT.count(),
+			transport_hint.c_str());
 			throw std::runtime_error(
 				"AdNav driver: device did not reply with DeviceInformation in time");
 		}
@@ -180,7 +180,7 @@ void Driver::waitForDevicePacket() {
 
 		if (bytes_received > 0)
 		 {
-			anpp_logger_.writeAndIncrement((char*) an_decoder_pointer(&an_decoder), bytes_received);
+			anpp_logger_.writeAndIncrement(reinterpret_cast<char*>(an_decoder_pointer(&an_decoder)), bytes_received);
 			an_decoder_increment(&an_decoder, bytes_received);
 
 			while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
@@ -539,7 +539,7 @@ void Driver::setupParams() {
 	packet_timer_period_description.integer_range.push_back(ptpdRange);
 	this->declare_parameter<int>("packet_timer_period", 10000, packet_timer_period_description);
 	if( validatePacketTimer(this->get_parameter("packet_timer_period") ).successful) { // Check that it is valid and save
-		packet_timer_period_ = (int) this->get_parameter("packet_timer_period").as_int();
+		packet_timer_period_ = static_cast<int>(this->get_parameter("packet_timer_period").as_int());
 	}else {// If invalid save default.
 		RCLCPP_ERROR(this->get_logger(), "Invalid packet timer period. Setting to default: %d", DEFAULT_PACKET_TIMER_PERIOD);
 		this->set_parameter(rclcpp::Parameter("packet_timer_period", DEFAULT_PACKET_TIMER_PERIOD));
@@ -571,7 +571,7 @@ void Driver::setupParams() {
 	portRange.step 		 = 1;
 	ip_port_description.integer_range.push_back(portRange);
 	this->declare_parameter<int>("port", 0, ip_port_description);
-	comms_data_.port = (int) this->get_parameter("port").as_int();
+	comms_data_.port = static_cast<int>(this->get_parameter("port").as_int());
 
 	// Logging Path - Read Only
 	rcl_interfaces::msg::ParameterDescriptor log_path_description = rcl_interfaces::msg::ParameterDescriptor();
@@ -1283,7 +1283,7 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketTimer(const rclcp
  * @param parameter const rclcpp::Parameter. updated PacketTimer parameter
  */
 void Driver::updatePacketTimer(const rclcpp::Parameter& parameter) {
-	packet_timer_period_ = (int) parameter.as_int();
+	packet_timer_period_ = static_cast<int>(parameter.as_int());
 
 	// Send to the device.
 	(void) SendPacketTimer(packet_timer_period_);
@@ -1352,7 +1352,7 @@ void Driver::getDataFromHostStr(const std::string& host) {
 			RCLCPP_ERROR(this->get_logger(), "Invalid Address.");
 			return;
 		}
-		ntrip_state_.he = gethostbyaddr((char*) &addr, sizeof(addr), AF_INET);
+		ntrip_state_.he = gethostbyaddr(reinterpret_cast<char*>(&addr), sizeof(addr), AF_INET);
 		if(ntrip_state_.he == nullptr) {
 			ntrip_state_.he = gethostbyname(split_string.front().c_str());
 		}
@@ -1398,10 +1398,10 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
 	for (int i = 0; i < number_of_full_size_anpp; ++i) {
 		// Write to the debug string
 		char buf[10];
-		sprintf(buf, "%02X ", static_cast<uint8_t>(buffer[buffer_idx]));
+		snprintf(buf, sizeof(buf), "%02X ", static_cast<uint8_t>(buffer[buffer_idx]));
 		ss << buf;
 
-		rtcm_corrections_packet.packet_data = (uint8_t*)(&buffer[buffer_idx]);
+		rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(&buffer[buffer_idx]);
 		// The packet is full send it to the device.
 		an_packet = encode_rtcm_corrections_packet(&rtcm_corrections_packet, 255);
 		RCLCPP_DEBUG(this->get_logger(), "Sending RTCM Corrections Packet with %d bytes", an_packet->length);
@@ -1410,7 +1410,7 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
 	}
 
 	// Send the final partially filled packet
-	rtcm_corrections_packet.packet_data = (uint8_t*)(&buffer[buffer_idx]);
+	rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(&buffer[buffer_idx]);
 	an_packet = encode_rtcm_corrections_packet(&rtcm_corrections_packet, size_of_last_packet);
 	RCLCPP_DEBUG(this->get_logger(), "Sending RTCM Corrections Packet with %d bytes", an_packet->length);
 	encodeAndSend(an_packet);
@@ -1621,7 +1621,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 
 	int j = 0;
 	for(adnav_interfaces::msg::PacketPeriod i : periods) {
-		ss << "\tID: " << (int)i.packet_id << "\tPeriod: "<< i.packet_period << std::endl;
+		ss << "\tID: " << static_cast<int>(i.packet_id) << "\tPeriod: "<< i.packet_period << std::endl;
 		packet_periods_packet.packet_periods[j].packet_id = i.packet_id;
 		packet_periods_packet.packet_periods[j].period = i.packet_period;
 		j++;
