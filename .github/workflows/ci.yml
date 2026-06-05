@@ -17,31 +17,30 @@ jobs:
   build:
     name: Build (ROS 2 Humble / Ubuntu 22.04)
     runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
 
     steps:
       - uses: actions/checkout@v6
         with:
           submodules: recursive
 
-      # Adds the ROS 2 apt repository, installs ros-humble-ros-base, and
-      # initialises + updates rosdep.
-      - uses: ros-tooling/setup-ros@v0.7
-        with:
-          required-ros-distributions: humble
-
-      # Install all declared build/exec dependencies that are not provided as
-      # source in this workspace (i.e. everything except adnav_interfaces and
-      # adnav_driver itself).
-      - name: Install dependencies (rosdep)
+      # The ros:humble-ros-base image has rosdep initialised already.
+      # Install colcon (not in the base image) then pull in all declared
+      # ROS dependencies for the three packages in this workspace.
+      - name: Install colcon and dependencies
         run: |
-          rosdep update
-          sudo rosdep install \
+          apt-get update -q
+          apt-get install -y --no-install-recommends python3-colcon-common-extensions
+          rosdep update --rosdistro humble
+          rosdep install \
             --from-paths adnav_driver adnav_interfaces adnav_launch \
             --ignore-src \
             --rosdistro humble \
             -y
 
       - name: Build workspace
+        shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           colcon build \
@@ -56,6 +55,8 @@ jobs:
   test:
     name: Test (ROS 2 Humble / Ubuntu 22.04)
     runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
     needs: build
 
     steps:
@@ -63,14 +64,12 @@ jobs:
         with:
           submodules: recursive
 
-      - uses: ros-tooling/setup-ros@v0.7
-        with:
-          required-ros-distributions: humble
-
-      - name: Install dependencies (rosdep)
+      - name: Install colcon and dependencies (including test deps)
         run: |
-          rosdep update
-          sudo rosdep install \
+          apt-get update -q
+          apt-get install -y --no-install-recommends python3-colcon-common-extensions
+          rosdep update --rosdistro humble
+          rosdep install \
             --from-paths adnav_driver adnav_interfaces adnav_launch \
             --ignore-src \
             --rosdistro humble \
@@ -78,6 +77,7 @@ jobs:
 
       # Build with testing enabled so ament generates the test targets.
       - name: Build workspace (with tests)
+        shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           colcon build \
@@ -85,6 +85,7 @@ jobs:
             --event-handlers console_direct+
 
       - name: Run tests
+        shell: bash
         run: |
           source /opt/ros/humble/setup.bash
           source install/local_setup.bash
@@ -94,6 +95,4 @@ jobs:
 
       - name: Test results summary
         if: always()
-        run: |
-          source /opt/ros/humble/setup.bash
-          colcon test-result --verbose
+        run: colcon test-result --verbose
