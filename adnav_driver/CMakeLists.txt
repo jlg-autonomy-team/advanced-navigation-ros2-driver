@@ -1,97 +1,104 @@
-cmake_minimum_required(VERSION 3.5)
-set(CMAKE_BUILD_TYPE release)
+cmake_minimum_required(VERSION 3.10)
 project(adnav_driver)
 
-# Default to C99
+# Default to release builds; honour user-supplied CMAKE_BUILD_TYPE first.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT CMAKE_C_STANDARD)
   set(CMAKE_C_STANDARD 99)
 endif()
-
-# Default to C++14
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 14)
+  set(CMAKE_CXX_STANDARD 17)
 endif()
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra)
 endif()
 
-# Avoid Confusing max() and min() for Windows Macros. See rclcpp issue #1054
+# Avoid clashing with Windows max()/min() macros. See rclcpp issue #1054.
 if(WIN32)
   add_definitions(-DNOMINMAX)
 endif()
 
-#find dependencies
+# --- Dependencies ----------------------------------------------------------
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
-find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(adnav_interfaces REQUIRED)
 
-# Build
-include_directories(
-  include/adnav_driver
-  ../an-ros-common/include
-)
-
-aux_source_directory(src src_MAIN)
-aux_source_directory(../an-ros-common/src src_COMMON)
-
-add_library(${PROJECT_NAME}_lib
-  ${src_MAIN}
-  ${src_COMMON}
-)
-
 set(DEPENDENCIES
-  "rclcpp"
-  "std_msgs"
-  "std_srvs"
-  "sensor_msgs"
-  "diagnostic_msgs"
-  "geometry_msgs"
-  "tf2"
-  "adnav_interfaces"
+  rclcpp
+  std_msgs
+  std_srvs
+  sensor_msgs
+  diagnostic_msgs
+  geometry_msgs
+  tf2
+  adnav_interfaces
 )
 
-set(EXECUTABLE_NAME "adnav_driver")
+# --- Sources ---------------------------------------------------------------
+# We depend on `an-ros-common` (a sibling submodule) for the ANPP C library
+# and shared helper classes. List the files explicitly rather than globbing
+# so a configure run isn't required when files are added/removed in the
+# submodule and so we get accurate dep-tracking.
+
+set(ANROSCOMMON_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../an-ros-common)
+
+set(ANROSCOMMON_SRC
+  ${ANROSCOMMON_DIR}/src/adnav_comms.cpp
+  ${ANROSCOMMON_DIR}/src/adnav_ntrip.cpp
+  ${ANROSCOMMON_DIR}/src/adnav_utils.cpp
+  ${ANROSCOMMON_DIR}/src/an_packet_protocol.c
+  ${ANROSCOMMON_DIR}/src/ins_packets.c
+  ${ANROSCOMMON_DIR}/src/rs232.c
+)
+
+set(DRIVER_SRC
+  src/adnav_driver.cpp
+)
+
+# --- Library ---------------------------------------------------------------
+add_library(${PROJECT_NAME}_lib ${DRIVER_SRC} ${ANROSCOMMON_SRC})
+
+target_include_directories(${PROJECT_NAME}_lib
+  PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/adnav_driver>
+    $<BUILD_INTERFACE:${ANROSCOMMON_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
 
 ament_target_dependencies(${PROJECT_NAME}_lib ${DEPENDENCIES})
 
-add_executable(${EXECUTABLE_NAME} src/main.cpp)
-target_link_libraries(${EXECUTABLE_NAME} ${PROJECT_NAME}_lib)
-ament_target_dependencies(${EXECUTABLE_NAME} ${DEPENDENCIES})
+# Explicit dep edge on adnav_interfaces' generated IDL targets so a parallel
+# `colcon build` doesn't race the .hpp generation. (B3)
+if(TARGET adnav_interfaces__rosidl_typesupport_cpp)
+  add_dependencies(${PROJECT_NAME}_lib adnav_interfaces__rosidl_typesupport_cpp)
+endif()
 
-# add_executable(srv_test src/srv_test.cpp)
-# target_link_libraries(srv_test ${PROJECT_NAME}_lib)
-# ament_target_dependencies(srv_test ${DEPENDENCIES})
+# --- Executable ------------------------------------------------------------
+add_executable(${PROJECT_NAME} src/main.cpp)
+target_link_libraries(${PROJECT_NAME} ${PROJECT_NAME}_lib)
+ament_target_dependencies(${PROJECT_NAME} ${DEPENDENCIES})
 
-install(TARGETS ${EXECUTABLE_NAME}
+# --- Install ---------------------------------------------------------------
+install(TARGETS ${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}
 )
-
-# install(TARGETS srv_test
-#   DESTINATION lib/${PROJECT_NAME}
-# )
-
 install(
   DIRECTORY include/
   DESTINATION include
 )
 
 if(BUILD_TESTING)
-  # find_package(ament_lint_auto REQUIRED)
   find_package(ament_cmake_cpplint REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  # set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  # set(ament_cmake_cpplint_FOUND TRUE)
-  # ament_lint_auto_find_test_dependencies()
   ament_cpplint()
 endif()
 

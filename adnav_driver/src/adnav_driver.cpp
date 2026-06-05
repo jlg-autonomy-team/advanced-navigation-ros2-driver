@@ -108,31 +108,79 @@ Driver::~Driver() {
 }
 
 /**
- * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
+ * @brief Block until the device replies to a DeviceInformation request, or
+ * a wall-clock timeout elapses.
+ *
+ * Previously this function spun forever on the wrong port / wrong device,
+ * with no log output beyond the initial DEBUG trace. Now we re-issue the
+ * request periodically (every ~1 s), surface progress at INFO/WARN level,
+ * and after WAIT_FOR_DEVICE_INFO_TIMEOUT throw an std::runtime_error so
+ * the rclcpp executor terminates the node cleanly. (C15)
  */
 void Driver::waitForDevicePacket() {
-	// initialize the decoder.
 	an_decoder_t an_decoder;
 	an_packet_t *an_packet;
 	an_decoder_initialise(&an_decoder);
 	bool recieved = false;
 	int bytes_received;
 
-	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
+	RCLCPP_INFO(this->get_logger(),
+		"Waiting for device-information reply (timeout %lds)...",
+		static_cast<long>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()));
+
+	const auto deadline = std::chrono::steady_clock::now() + WAIT_FOR_DEVICE_INFO_TIMEOUT;
+	auto next_request_at = std::chrono::steady_clock::now();
 
 	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
+		const auto now = std::chrono::steady_clock::now();
+		if (now >= deadline) {
+			std::string transport_hint;
+			switch (comms_data_.method) {
+				case adnav::CONNECTION_SERIAL:
+					transport_hint = "serial port " + comms_data_.com_port +
+						" @ " + std::to_string(comms_data_.baud_rate) + " baud";
+					break;
+				case adnav::CONNECTION_TCP_CLIENT:
+					transport_hint = "TCP client connecting to " +
+						comms_data_.ip_address + ":" + std::to_string(comms_data_.port);
+					break;
+				case adnav::CONNECTION_TCP_SERVER:
+					transport_hint = "TCP server on local port " +
+						std::to_string(comms_data_.port) +
+						" (no client has connected and sent a DeviceInformation packet)";
+					break;
+				case adnav::CONNECTION_UDP_CLIENT:
+					transport_hint = "UDP receiver on local port " +
+						std::to_string(comms_data_.port) +
+						" (no datagrams received from the device)";
+					break;
+				default:
+					transport_hint = "(unknown transport)";
+					break;
+			}
+			RCLCPP_ERROR(this->get_logger(),
+				"Timed out after %lds waiting for the device to reply with a "
+				"DeviceInformation packet. Transport: %s. Check that the device "
+				"is powered, connected, and configured to talk over this transport.",
+				static_cast<long>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()),
+				transport_hint.c_str());
+			throw std::runtime_error(
+				"AdNav driver: device did not reply with DeviceInformation in time");
+		}
 
-		// Read in some data from the connection.
-		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		// Re-issue the request every second; the first request goes out
+		// immediately because next_request_at == now.
+		if (now >= next_request_at) {
+			requestDeviceInfo();
+			next_request_at = now + std::chrono::seconds(1);
+		}
 
-		// Decode all data and act on only the device info data.
+		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder),
+		                                     an_decoder_size(&an_decoder));
+
 		if (bytes_received > 0)
 		 {
 			anpp_logger_.writeAndIncrement((char*) an_decoder_pointer(&an_decoder), bytes_received);
-
-			// Increment the decode buffer length by the number of bytes received
 			an_decoder_increment(&an_decoder, bytes_received);
 
 			while ((an_packet = an_packet_decode(&an_decoder)) != NULL)
@@ -143,12 +191,13 @@ void Driver::waitForDevicePacket() {
 					RCLCPP_DEBUG(this->get_logger(), "Received Device Information Packet (ANPP.3)");
 					deviceInfoDecoder(an_packet);
 					recieved = true;
-
 				}
 
-				// Ensure that you free the an_packet when your done with it or you will leak memory
 				an_packet_free(&an_packet);
 			}
+		} else {
+			// No bytes available; small sleep to avoid spinning the CPU.
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
 		}
 	}
 }
@@ -175,7 +224,10 @@ void Driver::createPublishers() {
 	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>(std::string(node_name_ + "/barometric_pressure"), 10);
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(std::string(node_name_ + "/temperature"), 10);
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
-	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
+	twist_stamped_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>(std::string(node_name_ + "/twist_stamped"), 10);
+	pose_stamped_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>(std::string(node_name_ + "/pose_stamped"), 10);
+	ecef_position_pub_ = this->create_publisher<geometry_msgs::msg::PointStamped>(std::string(node_name_ + "/ecef_position"), 10);
+	orientation_rph_pub_ = this->create_publisher<adnav_interfaces::msg::RPH>(std::string(node_name_ + "/orientation_rph"), 10);
 	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
 	filter_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/filter_status"), 10);
 }
@@ -226,30 +278,55 @@ void Driver::createServices() {
 }
 
 /**
- * @brief Method to push requested configuration to the device.
+ * @brief Method to push requested configuration to the device at startup.
  *
- * This method will take stored data on the configurationand form configuration packets which
- * will then be pushed to the device.
+ * Builds, sends, and waits for an acknowledgement on each configuration
+ * packet (PacketTimerPeriod followed by PacketPeriods). Uses sendAndPollAck()
+ * because the rclcpp executor is not yet spinning at this point, so the
+ * read timer would never fire to drive AcknowledgeHandler() via the
+ * condition variable.
  */
 void Driver::deviceSetup() {
 	RCLCPP_INFO(this->get_logger(), "Sending requested configuration to device:");
 
-	// Create and send a Packet Timer Period Packet.
-	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
-	(void)SendPacketTimer(packet_timer_period_); // Will overwrite acknowledge_receive_ to false
+	// IMPORTANT: both writes use `permanent = 0` (transient, RAM-only on
+	// the device). Setting `permanent = 1` would persist the change to the
+	// device's flash on every driver startup, which over time chews through
+	// the chip's limited erase cycles. The driver's session-scoped use of
+	// these settings doesn't need persistence; users who genuinely want a
+	// permanent change can call the matching ROS service explicitly with
+	// `permanent: true`.
 
-	// Create and fill a periods format.
-	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
-	for(uint64_t i = 0; (i+i) < packet_request_.size(); i++) {
-		adnav_interfaces::msg::PacketPeriod period;
-		period.packet_id = packet_request_[i+i];
-		period.packet_period = packet_request_[i+i+1];
-		packet_periods.push_back(period);
+	// PacketTimerPeriod (configures the device's base timer tick).
+	{
+		packet_timer_period_packet_t pkt;
+		memset(&pkt, 0, sizeof(pkt));
+		pkt.permanent = 0;
+		pkt.utc_synchronisation = 1;
+		pkt.packet_timer_period = static_cast<uint16_t>(packet_timer_period_);
+
+		auto ack = sendAndPollAck(encode_packet_timer_period_packet(&pkt),
+		                          std::chrono::seconds(2));
+		logAck("PacketTimerPeriod", ack);
 	}
 
-	// Since we are not waiting for device acknowledgement at startup
-	acknowledge_recieve_ = true;
-	(void)SendPacketPeriods(packet_periods); // Will overwrite acknowledge_receive_ to false.
+	// PacketPeriods (configures which state packets the device emits and at what rate).
+	{
+		packet_periods_packet_t pkt;
+		memset(&pkt, 0, sizeof(pkt));
+		pkt.permanent = 0;
+		pkt.clear_existing_packets = 1;
+		const size_t pairs = packet_request_.size() / 2;
+		const size_t max_pairs = static_cast<size_t>(MAXIMUM_PACKET_PERIODS);
+		for (size_t i = 0; i < pairs && i < max_pairs; ++i) {
+			pkt.packet_periods[i].packet_id = static_cast<uint8_t>(packet_request_[2 * i]);
+			pkt.packet_periods[i].period    = static_cast<uint32_t>(packet_request_[2 * i + 1]);
+		}
+
+		auto ack = sendAndPollAck(encode_packet_periods_packet(&pkt),
+		                          std::chrono::seconds(2));
+		logAck("PacketPeriods", ack);
+	}
 }
 
 /**
@@ -307,33 +384,62 @@ void Driver::setupParamService() {
 void Driver::setupParams() {
 	std::stringstream ss;
 
-	// Baud Rate - Read only
-	rcl_interfaces::msg::ParameterDescriptor baud_description = rcl_interfaces::msg::ParameterDescriptor();
+	// Comms Select - Read only. Declared first so subsequent serial-only
+	// validations (baud_rate, com_port) can skip strict checking when an IP
+	// transport has been selected, preventing spurious "Invalid baud rate"
+	// errors from non-serial YAMLs that intentionally leave baud_rate=0.
+	rcl_interfaces::msg::ParameterDescriptor comms_select_description;
+	ss << 	"What method will be used to communicate with the device.\n"<<
+			"  0: Serial (default)\n" <<
+			"  1: TCP Client\n" <<
+			"  2: TCP Server\n" <<
+			"  3: UDP\n";
+	comms_select_description.description = ss.str();
+	ss.str("");
+	comms_select_description.name = "comm_select";
+	comms_select_description.read_only = true;
+	rcl_interfaces::msg::IntegerRange commRange;
+	commRange.from_value = 0;
+	commRange.to_value   = 3;  // CAN was advertised as id=4 but never implemented.
+	commRange.step       = 1;
+	comms_select_description.integer_range.push_back(commRange);
+	this->declare_parameter<int>("comm_select", adnav::CONNECTION_SERIAL, comms_select_description);
+	comms_data_.method = static_cast<int>(this->get_parameter("comm_select").as_int());
+	const bool is_serial = (comms_data_.method == adnav::CONNECTION_SERIAL);
+
+	// Baud Rate - Read only. Only validated strictly when comm_select == Serial.
+	rcl_interfaces::msg::ParameterDescriptor baud_description;
 	ss << 	"Baud rate for communication with AdvancedNavigation Device\n" <<
 			"Default: " << DEFAULT_BAUD_RATE;
 	baud_description.description = ss.str();
-	ss.str(""); // empty the stream
+	ss.str("");
 	baud_description.name = "baud_rate";
 	baud_description.read_only = true;
 	baud_description.additional_constraints = "\n\tSupported Baud Rates:\n\t  2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 500000, 576000, 921600, 1000000, 2000000";
 	this->declare_parameter<int>("baud_rate", DEFAULT_BAUD_RATE, baud_description);
-	if( validateBaudRate( this->get_parameter("baud_rate") ).successful ) { // Check that it is valid and save
-		comms_data_.baud_rate = (int) this->get_parameter("baud_rate").as_int();
-	}else {// If invalid save default.
+	if(!is_serial) {
+		// Baud is irrelevant for IP transports; just record whatever the user
+		// supplied and skip validation.
+		comms_data_.baud_rate = static_cast<int>(this->get_parameter("baud_rate").as_int());
+	} else if( validateBaudRate( this->get_parameter("baud_rate") ).successful ) {
+		comms_data_.baud_rate = static_cast<int>(this->get_parameter("baud_rate").as_int());
+	} else {
 		RCLCPP_ERROR(this->get_logger(), "Invalid baud rate. Setting to default: %d", DEFAULT_BAUD_RATE);
 		this->set_parameter(rclcpp::Parameter("baud_rate", DEFAULT_BAUD_RATE));
 		comms_data_.baud_rate = DEFAULT_BAUD_RATE;
 	}
 
-	// Com_port - Read only
-	rcl_interfaces::msg::ParameterDescriptor com_port_description = rcl_interfaces::msg::ParameterDescriptor();
+	// Com_port - Read only. Only meaningful for serial transport.
+	rcl_interfaces::msg::ParameterDescriptor com_port_description;
 	com_port_description.description = "Communications port for serial operation\n  Default: \"/dev/ttyUSB0\"";
 	com_port_description.name = "com_port";
 	com_port_description.read_only = true;
 	this->declare_parameter<std::string>("com_port", DEFAULT_COM_PORT, com_port_description);
-	if( validateComPort( this->get_parameter("com_port") ).successful ) { // Check that it is valid and save
+	if(!is_serial) {
 		comms_data_.com_port = this->get_parameter("com_port").as_string();
-	}else { // If invalid save default.
+	} else if( validateComPort( this->get_parameter("com_port") ).successful ) {
+		comms_data_.com_port = this->get_parameter("com_port").as_string();
+	} else {
 		RCLCPP_ERROR(this->get_logger(), "Invalid com port. Setting to default: %s", DEFAULT_COM_PORT);
 		this->set_parameter(rclcpp::Parameter("com_port", DEFAULT_COM_PORT));
 		comms_data_.com_port = DEFAULT_COM_PORT;
@@ -477,26 +583,18 @@ void Driver::setupParams() {
 	this->declare_parameter<std::string>("log_path", "~/.ros/log/", log_path_description);
 	log_path_ = this->get_parameter("log_path").as_string();
 
-
-	// Comms Select - Read only
-	rcl_interfaces::msg::ParameterDescriptor comms_select_description = rcl_interfaces::msg::ParameterDescriptor();
-	ss << 	"What method will be used to communicate with the device.\n"<<
-			"  Default: 0: Serial\n" <<
-			"  1: TCP Client\n" <<
-			"  2: TCP Server\n" <<
-			"  3: UDP\n" <<
-			"  4: CAN\n";
-	comms_select_description.description = ss.str();
-	ss.str(""); // empty the stream
-	comms_select_description.name = "comm_select";
-	comms_select_description.read_only = true;
-	rcl_interfaces::msg::IntegerRange commRange;
-	commRange.from_value = 0;
-	commRange.to_value   = 4;
-	commRange.step 		 = 1;
-	comms_select_description.integer_range.push_back(commRange);
-	this->declare_parameter<int>("comm_select", adnav::CONNECTION_SERIAL, comms_select_description);
-	comms_data_.method = (int) this->get_parameter("comm_select").as_int();
+	// Use Device Time - Read only
+	rcl_interfaces::msg::ParameterDescriptor use_device_time_desc;
+	use_device_time_desc.description =
+		"If true, populate header.stamp on SystemState-derived topics from the\n"
+		"device's reported UTC time + microseconds (set when the device's GNSS\n"
+		"acquires a time fix and the filter sets utc_time_initialised=1).\n"
+		"If false, or while the device hasn't yet UTC-synced, header.stamp\n"
+		"falls back to ROS wall-clock time (this->now()). Default: true.";
+	use_device_time_desc.name = "use_device_time";
+	use_device_time_desc.read_only = true;
+	this->declare_parameter<bool>("use_device_time", true, use_device_time_desc);
+	use_device_time_ = this->get_parameter("use_device_time").as_bool();
 }
 
 //~~~~~~ Control Functions
@@ -537,7 +635,7 @@ void Driver::publishTimerCallback() {
 	if(!msg_write_done_) {
 		time = this->get_clock().get()->now().nanoseconds();
 		// Only wait until timeout. otherwise log error and exit callback.
-		if (msg_cv_.wait_for(lock, std::chrono::milliseconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
+		if (msg_cv_.wait_for(lock, PUBLISH_WAIT_TIMEOUT) == std::cv_status::timeout) {
 			RCLCPP_DEBUG(this->get_logger(), "Publish Timeout");
 			if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
 			RCLCPP_DEBUG(this->get_logger(), "PubTimeout:\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
@@ -559,7 +657,10 @@ void Driver::publishTimerCallback() {
 	magnetic_field_pub_->publish(mag_field_msg_);
 	barometric_pressure_pub_->publish(baro_msg_);
 	temperature_pub_->publish(temp_msg_);
-	pose_pub_->publish(pose_msg_);
+	twist_stamped_pub_->publish(twist_stamped_msg_);
+	pose_stamped_pub_->publish(pose_stamped_msg_);
+	ecef_position_pub_->publish(ecef_position_msg_);
+	orientation_rph_pub_->publish(orientation_rph_msg_);
 
 	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
 
@@ -638,17 +739,23 @@ void Driver::statusWarnLog(const std::string& warnmsg) {
 void Driver::srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Request> request,
 		std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Response> response) {
 
-	// Send Config to device
-	SendPacketPeriods(request->periods, request->clear_existing_periods);
+	// SendPacketPeriods already calls AcknowledgeHandler() internally and
+	// returns the ack. Capture it directly - calling AcknowledgeHandler()
+	// again here would block forever waiting for a second ack that is
+	// never sent.
+	//
+	// Pass `request->permanent` through so users can opt in to a
+	// flash-saved write via the service. The internal `deviceSetup()`
+	// path uses `permanent=false` to avoid wearing the device's flash.
+	acknowledge_recieve_ = false;
+	response->acknowledgement = SendPacketPeriods(request->periods,
+		request->clear_existing_periods, request->permanent);
 
-	// Await the response
-	response->acknowledgement = AcknowledgeHandler();
-
-	// notify of result.
-	char buf[15];
-	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
-	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
-            response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
+	char buf[16];
+	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "Failure: %d\n", response->acknowledgement.result);
+	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s",
+		response->acknowledgement.id, response->acknowledgement.crc,
+		(response->acknowledgement.result == 0) ? "Success\n" : buf);
 }
 
 /**
@@ -660,17 +767,18 @@ void Driver::srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::Packe
 void Driver::srvPacketTimerPeriod(const std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Request> request,
 		std::shared_ptr<adnav_interfaces::srv::PacketTimerPeriod::Response> response) {
 
-	// Send config to device.
-	SendPacketTimer(request->packet_timer_period, request->utc_synchronisation, request->permanent);
+	// SendPacketTimer already calls AcknowledgeHandler() internally; capture
+	// its return value rather than calling AcknowledgeHandler() a second time
+	// (which would block forever waiting on an ack that was already consumed).
+	acknowledge_recieve_ = false;
+	response->acknowledgement = SendPacketTimer(request->packet_timer_period,
+		request->utc_synchronisation, request->permanent);
 
-	// Await the response.
-	response->acknowledgement = AcknowledgeHandler();
-
-	// notify of result.
-	char buf[15];
-	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
-	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
-            response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
+	char buf[16];
+	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "Failure: %d\n", response->acknowledgement.result);
+	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s",
+		response->acknowledgement.id, response->acknowledgement.crc,
+		(response->acknowledgement.result == 0) ? "Success\n" : buf);
 }
 
 /**
@@ -1327,6 +1435,90 @@ void Driver::encodeAndSend(an_packet_t* an_packet) {
 }
 
 /**
+ * @brief Send a packet and synchronously poll the transport for the matching
+ * Acknowledge response. Used during startup where the rclcpp executor is not
+ * yet spinning so AcknowledgeHandler() cannot be driven by the read timer.
+ *
+ * Takes ownership of `an_packet` (encodes, sends, frees).
+ *
+ * @param an_packet Allocated packet (e.g. from encode_packet_*_packet).
+ * @param timeout   Maximum wall-clock time to wait for the matching ack.
+ * @return RawAcknowledge with .result == 0 on success, .result == 255 on
+ * timeout, otherwise the device's reported failure code.
+ */
+adnav_interfaces::msg::RawAcknowledge Driver::sendAndPollAck(
+		an_packet_t* an_packet, std::chrono::milliseconds timeout) {
+	adnav_interfaces::msg::RawAcknowledge result;
+	result.id = 0;
+	result.crc = 0;
+	result.result = 255;  // distinguishable "timeout" sentinel
+
+	if (an_packet == nullptr) {
+		RCLCPP_ERROR(this->get_logger(),
+			"sendAndPollAck: encode returned null packet");
+		return result;
+	}
+
+	const uint8_t expected_id = an_packet->id;
+	encodeAndSend(an_packet);  // encodes, writes, frees
+
+	an_decoder_t dec;
+	an_decoder_initialise(&dec);
+
+	const auto deadline = std::chrono::steady_clock::now() + timeout;
+	while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline) {
+		const int bytes = communicator_->read(an_decoder_pointer(&dec),
+		                                      an_decoder_size(&dec));
+		if (bytes > 0) {
+			anpp_logger_.writeAndIncrement(
+				reinterpret_cast<char*>(an_decoder_pointer(&dec)), bytes);
+			an_decoder_increment(&dec, bytes);
+
+			an_packet_t* in_packet;
+			while ((in_packet = an_packet_decode(&dec)) != NULL) {
+				if (in_packet->id == packet_id_acknowledge) {
+					acknowledge_packet_t ack;
+					if (decode_acknowledge_packet(&ack, in_packet) == 0
+					    && ack.packet_id == expected_id) {
+						result.id = ack.packet_id;
+						result.crc = ack.packet_crc;
+						result.result = ack.acknowledge_result;
+						an_packet_free(&in_packet);
+						return result;
+					}
+				}
+				an_packet_free(&in_packet);
+			}
+		} else {
+			// No bytes available right now; back off briefly so we don't
+			// busy-spin on the file descriptor.
+			std::this_thread::sleep_for(std::chrono::milliseconds(2));
+		}
+	}
+
+	return result;
+}
+
+/**
+ * @brief Pretty-print a RawAcknowledge result at an appropriate log level.
+ */
+void Driver::logAck(const char* name,
+		const adnav_interfaces::msg::RawAcknowledge& ack) {
+	if (ack.result == 0) {
+		RCLCPP_INFO(this->get_logger(),
+			"%s acknowledged: SUCCESS (id=%u crc=%u)",
+			name, ack.id, ack.crc);
+	} else if (ack.result == 255) {
+		RCLCPP_ERROR(this->get_logger(),
+			"%s timed out waiting for acknowledgement", name);
+	} else {
+		RCLCPP_WARN(this->get_logger(),
+			"%s rejected by device: result=%u (id=%u crc=%u)",
+			name, ack.result, ack.id, ack.crc);
+	}
+}
+
+/**
  * @brief Function to handle the acknowledgement of configuration from a device in a thread safe manner.
  *
  * Needs to interact with the reading thread to receive the packet. Uses a conditional variable to flag when a
@@ -1341,7 +1533,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
 	// Wait for an acknowledge packet to be received.
 	std::unique_lock<std::mutex> lock(acknowledge_mutex_);
 	if(!acknowledge_recieve_) {
-		if(srv_cv_.wait_for(lock, std::chrono::seconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
+		if(srv_cv_.wait_for(lock, ACK_DEFAULT_TIMEOUT) == std::cv_status::timeout) {
 			RCLCPP_ERROR(this->get_logger(), "acknowledgement Timeout");
 			msg.result++; // make error condition
 			return msg;
@@ -1363,8 +1555,11 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @brief Function to send the packet Timer to the device and await the acknowledgement.
  *
  * @param packet_timer_period Period for the packet rates in microseconds.
- * @param UTC_sync Synchronize with UTC time. True by default.
- * @param permanent Is this a permanent change. True by default.
+ * @param utc_sync Synchronize with UTC time. True by default.
+ * @param permanent Persist the change to the device's flash. **False by
+ * default** so the driver does not consume flash erase cycles on every
+ * startup; pass `true` only when a session-spanning persistent change is
+ * intended (typically via the public ROS service handler).
  * @return acknowledgement Message
  */
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_period, bool utc_sync, bool permanent) {
@@ -1395,11 +1590,15 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketTimer(int packet_timer_p
 }
 
 /**
- * @brief Function to send the packet Timer to the device and await the acknowledgement.
+ * @brief Function to push a PacketPeriods configuration to the device.
  *
  * @param periods Vector of packet periods to be sent to the device.
- * @param clear_existing Boolean value for overwriting existing packet periods. Default = True.
- * @param permanent Boolean value for overwriting configuration memory. Default = True.
+ * @param clear_existing Wipe the device's existing schedule before adding
+ * the new entries. **True by default** because the driver's startup path
+ * is the canonical owner of the device's emit schedule for the session.
+ * @param permanent Persist the change to the device's flash. **False by
+ * default** to avoid consuming flash erase cycles on every driver startup;
+ * pass `true` only when a permanent change is intended.
  * @return acknowledgement Message
  */
 adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
@@ -1473,7 +1672,7 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
 				break;
 
-			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
+			case packet_id_euler_orientation_standard_deviation: eulerOrientSDRosDecoder(an_packet);
 				break;
 
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
@@ -1505,8 +1704,17 @@ void Driver::acknowledgeDecoder(an_packet_t* an_packet) {
 		RCLCPP_WARN(this->get_logger(), "Error decoding Acknowledge Packet");
 	}
 
-	RCLCPP_DEBUG(this->get_logger(), "acknowledgement received.\nID: %d\nResult: %d\n",
-		acknowledge_packet_.packet_id, acknowledge_packet_.acknowledge_result);
+	if (acknowledge_packet_.acknowledge_result == 0) {
+		RCLCPP_DEBUG(this->get_logger(),
+			"acknowledgement received: id=%u result=SUCCESS",
+			acknowledge_packet_.packet_id);
+	} else {
+		// Surface non-zero ack results so failed config writes don't disappear silently.
+		RCLCPP_WARN(this->get_logger(),
+			"Device rejected packet id=%u with acknowledge_result=%u",
+			acknowledge_packet_.packet_id,
+			acknowledge_packet_.acknowledge_result);
+	}
 
 	// Set the acknowledgement received to true
 	acknowledge_recieve_ = true;
@@ -1558,9 +1766,7 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 
 	if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
 	 {
-			// NAVSATFIX
-			nav_fix_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			nav_fix_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
+			// NAVSATFIX (header.stamp set after `stamp` is resolved below).
 			nav_fix_msg_.header.frame_id = frame_id_;
 			if ((system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_2d) ||
 				(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_3d))
@@ -1601,44 +1807,75 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			if(ntrip_client_.get() != nullptr) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
-			// TWIST
-			twist_msg_.linear.x = system_state_packet.velocity[0];
-			twist_msg_.linear.y = system_state_packet.velocity[1];
-			twist_msg_.linear.z = system_state_packet.velocity[2];
-			twist_msg_.angular.x = system_state_packet.angular_velocity[0];
-			twist_msg_.angular.y = system_state_packet.angular_velocity[1];
-			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
+			// Resolve the timestamp source: device unix_time + microseconds
+			// when the device has UTC sync, otherwise fall back to ROS wall
+			// clock so messages aren't published at the Unix epoch (1970)
+			// or the firmware's internal pre-sync default (e.g. 2013-01-02
+			// on the Certus Evo without a GNSS antenna). C3 fix.
+			builtin_interfaces::msg::Time stamp;
+			if (use_device_time_ && system_state_packet.filter_status.b.utc_time_initialised) {
+				stamp.sec = system_state_packet.unix_time_seconds;
+				stamp.nanosec = system_state_packet.microseconds * 1000;
+			} else {
+				stamp = this->now();
+			}
+			nav_fix_msg_.header.stamp = stamp;
 
+			// TWIST
+			// AN reports velocity in NED (world) and angular_velocity in FRD (body).
+			// REP-103 expects ENU world + FLU body for ROS topics:
+			//   v_enu = (v_e, v_n, -v_d) = (vel[1], vel[0], -vel[2])
+			//   w_flu = (wx, -wy, -wz)
+			twist_msg_.linear.x =  system_state_packet.velocity[1];
+			twist_msg_.linear.y =  system_state_packet.velocity[0];
+			twist_msg_.linear.z = -system_state_packet.velocity[2];
+			twist_msg_.angular.x =  system_state_packet.angular_velocity[0];
+			twist_msg_.angular.y = -system_state_packet.angular_velocity[1];
+			twist_msg_.angular.z = -system_state_packet.angular_velocity[2];
+
+			// TwistStamped wraps the twist with a header (more useful downstream).
+			twist_stamped_msg_.header.stamp = stamp;
+			twist_stamped_msg_.header.frame_id = frame_id_;
+			twist_stamped_msg_.twist = twist_msg_;
 
 			// IMU
-			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
+			imu_msg_.header.stamp = stamp;
 			imu_msg_.header.frame_id = frame_id_;
-			// Using the RPY orientation as done by cosama
+			// Orientation: AN reports roll/pitch/yaw in FRD body w.r.t. NED
+			// world. ROS REP-103 wants FLU body w.r.t. ENU world.
+			//   - World flip (NED -> ENU): yaw_enu = pi/2 - yaw_ned
+			//   - Body flip (FRD -> FLU): pitch sign inverts (Y axis flips
+			//     left<->right; roll about X is unchanged)
 			orientation_.setRPY(
-				system_state_packet.orientation[0],
-				system_state_packet.orientation[1],
-				M_PI/2.0f - system_state_packet.orientation[2] // REP 103
-			);
+				 system_state_packet.orientation[0],
+				-system_state_packet.orientation[1],
+				M_PI / 2.0 - system_state_packet.orientation[2]);
 			imu_msg_.orientation.x = orientation_[0];
 			imu_msg_.orientation.y = orientation_[1];
 			imu_msg_.orientation.z = orientation_[2];
 			imu_msg_.orientation.w = orientation_[3];
 
-			// POSE Orientation
-			pose_msg_.orientation.x = orientation_[0];
-			pose_msg_.orientation.y = orientation_[1];
-			pose_msg_.orientation.z = orientation_[2];
-			pose_msg_.orientation.w = orientation_[3];
+			// IMU body-frame quantities, FRD -> FLU body flip on Y, Z.
+			imu_msg_.angular_velocity.x =  system_state_packet.angular_velocity[0];
+			imu_msg_.angular_velocity.y = -system_state_packet.angular_velocity[1];
+			imu_msg_.angular_velocity.z = -system_state_packet.angular_velocity[2];
+			imu_msg_.linear_acceleration.x =  system_state_packet.body_acceleration[0];
+			imu_msg_.linear_acceleration.y = -system_state_packet.body_acceleration[1];
+			imu_msg_.linear_acceleration.z = -system_state_packet.body_acceleration[2];
 
-			imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0]; // These the same as the TWIST msg values
-			imu_msg_.angular_velocity.y = system_state_packet.angular_velocity[1];
-			imu_msg_.angular_velocity.z = system_state_packet.angular_velocity[2];
+			// PoseStamped (orientation only here; ECEF position is published separately).
+			pose_stamped_msg_.header.stamp = stamp;
+			pose_stamped_msg_.header.frame_id = frame_id_;
+			pose_stamped_msg_.pose.orientation = imu_msg_.orientation;
 
-			// The IMU linear acceleration is now coming from the RAW Sensors Accelerometer
-			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[0];
-			imu_msg_.linear_acceleration.y = system_state_packet.body_acceleration[1];
-			imu_msg_.linear_acceleration.z = system_state_packet.body_acceleration[2];
+			// Roll/Pitch/Heading triple in REP-103 convention. AN reports
+			// heading as the angle from North clockwise; ROS heading
+			// convention is from East counter-clockwise. Use the same
+			// (yaw_enu = pi/2 - yaw_ned) and pitch sign flip as for the
+			// quaternion above. C12 / issues #7, #11.
+			orientation_rph_msg_.roll    =  system_state_packet.orientation[0];
+			orientation_rph_msg_.pitch   = -system_state_packet.orientation[1];
+			orientation_rph_msg_.heading = M_PI / 2.0 - system_state_packet.orientation[2];
 
 			// SYSTEM STATUS
 			system_status_msg_.message = "";
@@ -1817,12 +2054,18 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 	// Debug timekeeper
 	auto time = this->get_clock().get()->now().nanoseconds();
 
-	// ECEF Position (in meters) Packet for Pose Message
+	// ECEF Position is in metres in an Earth-Centred-Earth-Fixed frame.
+	// Publish via a dedicated PointStamped on its own topic with a distinct
+	// frame_id ("earth"); previously this was dumped into pose.position
+	// alongside body-frame orientation, which gave consumers no way to
+	// tell what frame the position lived in.
 	if(decode_ecef_position_packet(&ecef_position_packet, an_packet) == 0)
 	 {
-		pose_msg_.position.x = ecef_position_packet.position[0];
-		pose_msg_.position.y = ecef_position_packet.position[1];
-		pose_msg_.position.z = ecef_position_packet.position[2];
+		ecef_position_msg_.header.stamp = this->now();
+		ecef_position_msg_.header.frame_id = "earth";
+		ecef_position_msg_.point.x = ecef_position_packet.position[0];
+		ecef_position_msg_.point.y = ecef_position_packet.position[1];
+		ecef_position_msg_.point.z = ecef_position_packet.position[2];
 	}
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
@@ -1833,33 +2076,35 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
 }
 
 /**
- * @brief Function to decode the Quaternion Orientation Standard Deviation ANPP Packet (ANPP.27).
+ * @brief Function to decode the Euler Orientation Standard Deviation ANPP Packet (ANPP.26).
  *
  * This function accesses in a thread safe manner the class stored ROS messages, placed relevant information into them,
  * then using the publishing control variable, requests a publisher thread to publish the message.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
-void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
-	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
+void Driver::eulerOrientSDRosDecoder(an_packet_t* an_packet) {
+	euler_orientation_standard_deviation_packet_t euler_orientation_standard_deviation_packet;
 	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27: \tMutex: L\tAccess: %d", P27_num_);
+	RCLCPP_DEBUG(this->get_logger(), "Packet 26: \tMutex: L\tAccess: %d", P26_num_);
 	// Debug timekeeper
 	auto time = this->get_clock().get()->now().nanoseconds();
 
-	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
+	if(decode_euler_orientation_standard_deviation_packet(&euler_orientation_standard_deviation_packet, an_packet) == 0)
 	 {
-		// IMU message
-		imu_msg_.orientation_covariance[0] = quaternion_orientation_standard_deviation_packet.standard_deviation[0];
-		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
-		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
+		// Imu.orientation_covariance is row-major covariance about (x, y, z),
+		// so the diagonal holds variances (sigma^2). The Euler stddev packet
+		// reports values about (roll, pitch, yaw) which align with x, y, z
+		// for an FRD body frame. Square to convert stddev -> variance.
+		imu_msg_.orientation_covariance[0] = std::pow(static_cast<double>(euler_orientation_standard_deviation_packet.standard_deviation[0]), 2);
+		imu_msg_.orientation_covariance[4] = std::pow(static_cast<double>(euler_orientation_standard_deviation_packet.standard_deviation[1]), 2);
+		imu_msg_.orientation_covariance[8] = std::pow(static_cast<double>(euler_orientation_standard_deviation_packet.standard_deviation[2]), 2);
 	}
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
 	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P27_num_++, diff/1000);
+	RCLCPP_DEBUG(this->get_logger(), "Packet 26:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P26_num_++, diff/1000);
 }
 
 /**
@@ -1881,29 +2126,48 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 	// Fill the messages
 	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
+		// Raw Sensors (ANPP 28) doesn't carry a UTC time of its own, so use
+		// node-wall-clock as the stamp. This avoids the previous behaviour of
+		// publishing every raw_sensors-derived topic with header.stamp == 0
+		// (Unix epoch), which downstream tf2 / robot_localization treat as
+		// stale and silently discard.
+		const auto stamp = this->now();
 
-		// RAW MAGNETICFIELD VALUE FROM IMU
+		// All raw sensor vectors arrive in FRD body frame; flip Y, Z to ROS
+		// FLU body convention. ANPP 28 reports magnetometers in milligauss;
+		// sensor_msgs/MagneticField is in Tesla (1 mG = 1e-7 T).
+		mag_field_msg_.header.stamp = stamp;
 		mag_field_msg_.header.frame_id = frame_id_;
-		mag_field_msg_.magnetic_field.x = raw_sensors_packet.magnetometers[0];
-		mag_field_msg_.magnetic_field.y = raw_sensors_packet.magnetometers[1];
-		mag_field_msg_.magnetic_field.z = raw_sensors_packet.magnetometers[2];
+		constexpr double MILLIGAUSS_TO_TESLA = 1e-7;
+		mag_field_msg_.magnetic_field.x =  raw_sensors_packet.magnetometers[0] * MILLIGAUSS_TO_TESLA;
+		mag_field_msg_.magnetic_field.y = -raw_sensors_packet.magnetometers[1] * MILLIGAUSS_TO_TESLA;
+		mag_field_msg_.magnetic_field.z = -raw_sensors_packet.magnetometers[2] * MILLIGAUSS_TO_TESLA;
 
+		imu_raw_msg_.header.stamp = stamp;
 		imu_raw_msg_.header.frame_id = frame_id_;
 		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
-		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[0];
-		imu_raw_msg_.linear_acceleration.y = raw_sensors_packet.accelerometers[1];
-		imu_raw_msg_.linear_acceleration.z = raw_sensors_packet.accelerometers[2];
-		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[0];
-		imu_raw_msg_.angular_velocity.y = raw_sensors_packet.gyroscopes[1];
-		imu_raw_msg_.angular_velocity.z = raw_sensors_packet.gyroscopes[2];
+		imu_raw_msg_.linear_acceleration.x =  raw_sensors_packet.accelerometers[0];
+		imu_raw_msg_.linear_acceleration.y = -raw_sensors_packet.accelerometers[1];
+		imu_raw_msg_.linear_acceleration.z = -raw_sensors_packet.accelerometers[2];
+		imu_raw_msg_.angular_velocity.x =  raw_sensors_packet.gyroscopes[0];
+		imu_raw_msg_.angular_velocity.y = -raw_sensors_packet.gyroscopes[1];
+		imu_raw_msg_.angular_velocity.z = -raw_sensors_packet.gyroscopes[2];
 
 		// BAROMETRIC PRESSURE
+		// sensor_msgs/FluidPressure documents variance==0 as "unknown",
+		// which matches reality for the AN raw-pressure feed (no variance
+		// is reported by the device).
+		baro_msg_.header.stamp = stamp;
 		baro_msg_.header.frame_id = frame_id_;
 		baro_msg_.fluid_pressure = raw_sensors_packet.pressure;
+		baro_msg_.variance = 0.0;
 
 		// TEMPERATURE
+		// sensor_msgs/Temperature documents variance==0 as "unknown".
+		temp_msg_.header.stamp = stamp;
 		temp_msg_.header.frame_id = frame_id_;
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
+		temp_msg_.variance = 0.0;
 
 	}
 	// Now that work is complete notify an update for the publisher.

@@ -12,15 +12,36 @@ find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
-# Declare message and service files from an-ros-common
-file(GLOB msg_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/msg/*.msg")
-file(GLOB srv_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/srv/*.srv")
+# Message and service definitions live in the an-ros-common submodule (shared
+# with the ROS 1 driver). List them explicitly rather than globbing so a
+# configure run isn't required when files are added/removed in the submodule.
+set(_AN_ROS_COMMON ../an-ros-common)
+set(msg_files
+  ${_AN_ROS_COMMON}/msg/ANPPHeader.msg
+  ${_AN_ROS_COMMON}/msg/DeviceInformationPacket.msg
+  ${_AN_ROS_COMMON}/msg/FilterStatus.msg
+  ${_AN_ROS_COMMON}/msg/GNSSFixStatus.msg
+  ${_AN_ROS_COMMON}/msg/LLH.msg
+  ${_AN_ROS_COMMON}/msg/NED.msg
+  ${_AN_ROS_COMMON}/msg/PacketPeriod.msg
+  ${_AN_ROS_COMMON}/msg/RPH.msg
+  ${_AN_ROS_COMMON}/msg/RawAcknowledge.msg
+  ${_AN_ROS_COMMON}/msg/RawStatusPacket.msg
+  ${_AN_ROS_COMMON}/msg/RequestPacket.msg
+  ${_AN_ROS_COMMON}/msg/SerialInterface.msg
+  ${_AN_ROS_COMMON}/msg/SystemStatus.msg
+)
+set(srv_files
+  ${_AN_ROS_COMMON}/srv/Ntrip.srv
+  ${_AN_ROS_COMMON}/srv/PacketPeriods.srv
+  ${_AN_ROS_COMMON}/srv/PacketTimerPeriod.srv
+  ${_AN_ROS_COMMON}/srv/RequestPackets.srv
+)
 
-# Build the message interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
   ${msg_files}
   ${srv_files}
-  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces # Packages that above messages depend on
+  DEPENDENCIES std_msgs geometry_msgs builtin_interfaces
 )
 
 if(BUILD_TESTING)

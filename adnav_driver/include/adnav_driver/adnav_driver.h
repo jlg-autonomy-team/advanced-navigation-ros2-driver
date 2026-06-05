@@ -42,6 +42,7 @@
 #include <string>       // std::string
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
+#include <thread>       // std::this_thread::sleep_for
 
 #include <rs232.h>
 #include <an_packet_protocol.h>
@@ -57,6 +58,7 @@
 #include <adnav_interfaces/srv/request_packets.hpp>
 #include <adnav_interfaces/srv/ntrip.hpp>
 #include <adnav_interfaces/msg/llh.hpp>
+#include <adnav_interfaces/msg/rph.hpp>
 
 // ROS2 Packages, Services, Messages
 #include <rclcpp/rclcpp.hpp>
@@ -67,7 +69,10 @@
 #include <sensor_msgs/msg/time_reference.hpp>
 #include <sensor_msgs/msg/imu.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <geometry_msgs/msg/twist_stamped.hpp>
 #include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <sensor_msgs/msg/magnetic_field.hpp>
 #include <sensor_msgs/msg/temperature.hpp>
@@ -101,12 +106,18 @@ constexpr const int    DEFAULT_BAUD_RATE = 115200;
 constexpr const int    DEFAULT_TIMER_PERIOD = 20000;
 constexpr const int    DEFAULT_PACKET_TIMER_PERIOD = 10000;
 constexpr const char * DEFAULT_COM_PORT = "ttyUSB0";
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10";
+constexpr const int    DEFAULT_PACKET_REQUEST[6] = {20, 10, 28, 10, 26, 10};
+constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10, 26, 10";
 constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
 constexpr const bool   DEFAULT_NTRIP_STATE = false;
 constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
 constexpr const int    DEFAULT_TIMEOUT = 5;
+// `DEFAULT_TIMEOUT` is interpreted as seconds by AcknowledgeHandler() but was
+// previously interpreted as milliseconds inside publishTimerCallback(). Use
+// these explicit constants instead.
+constexpr const std::chrono::seconds      ACK_DEFAULT_TIMEOUT{5};
+constexpr const std::chrono::milliseconds PUBLISH_WAIT_TIMEOUT{50};
+constexpr const std::chrono::seconds      WAIT_FOR_DEVICE_INFO_TIMEOUT{30};
 constexpr const int    MAX_TIMER_PERIOD = 65535;
 constexpr const int    MIN_TIMER_PERIOD = 1000;
 constexpr const int    MIN_PACKET_PERIOD = 1;
@@ -133,7 +144,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
  private:
     // Debug variables
-    int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P27_num_ = 0, P33_num_ = 0, P0_num_ = 0;
+    int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P26_num_ = 0, P33_num_ = 0, P0_num_ = 0;
 
     // Defines what communication method to use, refer to adnav_driver_connection_e.
     int communication_state_;
@@ -161,16 +172,24 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     acknowledge_packet_t acknowledge_packet_;  // only access with protection of acknowledge_mutex_
     device_information_packet_t device_information_packet_;
 
+    // Whether to use the device's reported UTC time (when synced) for ROS
+    // header.stamp on SystemState-derived topics. Falls back to ROS wall
+    // clock when false, or when the device hasn't yet UTC-synced.
+    bool use_device_time_;
+
     // Msgs. Only access with protection of messages_mutex_
-    tf2::Quaternion                 orientation_;
-    sensor_msgs::msg::Imu           imu_msg_;
-    sensor_msgs::msg::Imu           imu_raw_msg_;
-    sensor_msgs::msg::MagneticField mag_field_msg_;
-    sensor_msgs::msg::NavSatFix     nav_fix_msg_;
-    sensor_msgs::msg::FluidPressure baro_msg_;
-    sensor_msgs::msg::Temperature   temp_msg_;
-    geometry_msgs::msg::Twist       twist_msg_;
-    geometry_msgs::msg::Pose        pose_msg_;
+    tf2::Quaternion                  orientation_;
+    sensor_msgs::msg::Imu            imu_msg_;
+    sensor_msgs::msg::Imu            imu_raw_msg_;
+    sensor_msgs::msg::MagneticField  mag_field_msg_;
+    sensor_msgs::msg::NavSatFix      nav_fix_msg_;
+    sensor_msgs::msg::FluidPressure  baro_msg_;
+    sensor_msgs::msg::Temperature    temp_msg_;
+    geometry_msgs::msg::Twist        twist_msg_;
+    geometry_msgs::msg::TwistStamped twist_stamped_msg_;
+    geometry_msgs::msg::PoseStamped  pose_stamped_msg_;
+    geometry_msgs::msg::PointStamped ecef_position_msg_;
+    adnav_interfaces::msg::RPH       orientation_rph_msg_;
     diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
     diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
 
@@ -182,7 +201,10 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr 			barometric_pressure_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
-    rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr			twist_stamped_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr			pose_stamped_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PointStamped>::SharedPtr			ecef_position_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::RPH>::SharedPtr				orientation_rph_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
 
@@ -287,9 +309,25 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~ Device Communication Functions
     void encodeAndSend(an_packet_t* an_packet);
     adnav_interfaces::msg::RawAcknowledge AcknowledgeHandler();
-    adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
+    // `permanent` defaults to FALSE so the driver does not commit
+    // device-configuration writes to flash on every startup (would consume
+    // limited flash erase cycles for state that only needs to live for the
+    // current ROS session). Callers that genuinely want persistence -
+    // typically the public services exposed via `srvPacketTimerPeriod` and
+    // `srvPacketPeriods` - must pass `permanent=true` explicitly.
+    adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true, bool permanent = false);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
-        bool clear_existing = true, bool permanent = true);
+        bool clear_existing = true, bool permanent = false);
+
+    // Synchronous send-then-poll-for-ack helper used during startup, before the
+    // executor is spinning so the read timer is not yet firing. Takes ownership
+    // of `an_packet` (calls an_packet_encode + an_packet_free internally).
+    // Returns RawAcknowledge with .result == 255 on timeout.
+    adnav_interfaces::msg::RawAcknowledge sendAndPollAck(
+        an_packet_t* an_packet, std::chrono::milliseconds timeout);
+    // Pretty-prints a RawAcknowledge as INFO/WARN/ERROR depending on .result.
+    void logAck(const char* name,
+                const adnav_interfaces::msg::RawAcknowledge& ack);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
@@ -297,7 +335,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
     void ecefPosRosDecoder(an_packet_t* an_packet);
-    void quartOrientSDRosDriver(an_packet_t* an_packet);
+    void eulerOrientSDRosDecoder(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
 };
 

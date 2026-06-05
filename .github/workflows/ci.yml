@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Compile the full ROS 2 workspace (adnav_interfaces → adnav_driver →
+  # adnav_launch) against ROS 2 Humble on Ubuntu 22.04, which matches the
+  # docker/Dockerfile development environment.
+  #
+  # The an-ros-common submodule is pulled automatically via the checkout step;
+  # its sources are compiled as part of adnav_driver (no separate package.xml).
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build (ROS 2 Humble / Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      # Adds the ROS 2 apt repository, installs ros-humble-ros-base, and
+      # initialises + updates rosdep.
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+
+      # Install all declared build/exec dependencies that are not provided as
+      # source in this workspace (i.e. everything except adnav_interfaces and
+      # adnav_driver itself).
+      - name: Install dependencies (rosdep)
+        run: |
+          sudo rosdep install \
+            --from-paths adnav_driver adnav_interfaces adnav_launch \
+            --ignore-src \
+            --rosdistro humble \
+            -y
+
+      - name: Build workspace
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+            --event-handlers console_direct+
+
+  # ---------------------------------------------------------------------------
+  # Run the ament linters / tests that are declared in each package.
+  # adnav_driver uses ament_cpplint(); adnav_interfaces and adnav_launch skip
+  # cpplint but still run the remaining ament_lint_auto checks.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test (ROS 2 Humble / Ubuntu 22.04)
+    runs-on: ubuntu-22.04
+    needs: build
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: ros-tooling/setup-ros@v0.7
+        with:
+          required-ros-distributions: humble
+
+      - name: Install dependencies (rosdep)
+        run: |
+          sudo rosdep install \
+            --from-paths adnav_driver adnav_interfaces adnav_launch \
+            --ignore-src \
+            --rosdistro humble \
+            -y
+
+      # Build with testing enabled so ament generates the test targets.
+      - name: Build workspace (with tests)
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release \
+            --event-handlers console_direct+
+
+      - name: Run tests
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/local_setup.bash
+          colcon test \
+            --event-handlers console_direct+ \
+            --return-code-on-test-failure
+
+      - name: Test results summary
+        if: always()
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon test-result --verbose
