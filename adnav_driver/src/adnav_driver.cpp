@@ -126,7 +126,7 @@ void Driver::waitForDevicePacket() {
 
 	RCLCPP_INFO(this->get_logger(),
 		"Waiting for device-information reply (timeout %llds)...",
-		WAIT_FOR_DEVICE_INFO_TIMEOUT.count());
+		static_cast<std::int64_t>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()));
 
 	const auto deadline = std::chrono::steady_clock::now() + WAIT_FOR_DEVICE_INFO_TIMEOUT;
 	auto next_request_at = std::chrono::steady_clock::now();
@@ -162,7 +162,7 @@ void Driver::waitForDevicePacket() {
 			"Timed out after %llds waiting for the device to reply with a "
 			"DeviceInformation packet. Transport: %s. Check that the device "
 			"is powered, connected, and configured to talk over this transport.",
-			WAIT_FOR_DEVICE_INFO_TIMEOUT.count(),
+			static_cast<std::int64_t>(WAIT_FOR_DEVICE_INFO_TIMEOUT.count()),
 			transport_hint.c_str());
 			throw std::runtime_error(
 				"AdNav driver: device did not reply with DeviceInformation in time");
@@ -1401,7 +1401,7 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
 		snprintf(buf, sizeof(buf), "%02X ", static_cast<uint8_t>(buffer[buffer_idx]));
 		ss << buf;
 
-		rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(&buffer[buffer_idx]);
+		rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(const_cast<char*>(&buffer[buffer_idx]));
 		// The packet is full send it to the device.
 		an_packet = encode_rtcm_corrections_packet(&rtcm_corrections_packet, 255);
 		RCLCPP_DEBUG(this->get_logger(), "Sending RTCM Corrections Packet with %d bytes", an_packet->length);
@@ -1410,7 +1410,7 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
 	}
 
 	// Send the final partially filled packet
-	rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(&buffer[buffer_idx]);
+	rtcm_corrections_packet.packet_data = reinterpret_cast<uint8_t*>(const_cast<char*>(&buffer[buffer_idx]));
 	an_packet = encode_rtcm_corrections_packet(&rtcm_corrections_packet, size_of_last_packet);
 	RCLCPP_DEBUG(this->get_logger(), "Sending RTCM Corrections Packet with %d bytes", an_packet->length);
 	encodeAndSend(an_packet);
