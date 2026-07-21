@@ -109,6 +109,13 @@ Driver::~Driver() {
 
 /**
  * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
+ *
+ * ADV-153: bounded with a timeout + backoff instead of spinning forever. Confirmed on real
+ * hardware that a baud-rate/cabling mismatch left this looping at ~100% CPU indefinitely with
+ * no diagnostic, since the device never responds. Now: (1) sleeps briefly when no bytes are
+ * available instead of tight-looping the read() call, (2) only re-sends the request packet
+ * periodically instead of every single iteration, (3) throws after DEVICE_HANDSHAKE_TIMEOUT_SEC
+ * with a clear error so the caller (the constructor) fails fast and loud instead of hanging.
  */
 void Driver::waitForDevicePacket() {
 	// initialize the decoder.
@@ -120,9 +127,34 @@ void Driver::waitForDevicePacket() {
 
 	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
 
+	const auto handshake_start = std::chrono::steady_clock::now();
+	// ADV-153: initialise to "now - interval" (not time_point::min()) so the very first loop
+	// iteration's `now - last_request_time >= interval` check is guaranteed to be true and
+	// actually fire the first request. Using time_point::min() here overflowed the duration
+	// subtraction (undefined behaviour) and silently made the check false forever, so
+	// requestDeviceInfo() was never called - confirmed on hardware: a manual, correctly-framed
+	// ANPP request via a raw serial connection got an immediate response, but this loop's own
+	// request was never actually sent.
+	auto last_request_time = handshake_start - std::chrono::milliseconds(DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS);
+
 	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
+		const auto now = std::chrono::steady_clock::now();
+
+		if (now - handshake_start >= std::chrono::seconds(DEVICE_HANDSHAKE_TIMEOUT_SEC)) {
+			RCLCPP_ERROR(this->get_logger(),
+				"Timed out after %d seconds waiting for a Device Information Packet (ANPP.3) response. "
+				"Check that the device is powered, the cable/port (%s) is correct, and that baud_rate "
+				"(%d) matches the device's actual configured baud rate.",
+				DEVICE_HANDSHAKE_TIMEOUT_SEC, comms_data_.com_port.c_str(), comms_data_.baud_rate);
+			throw std::runtime_error("Timed out waiting for device handshake (Device Information Packet)");
+		}
+
+		// Only re-send the request packet periodically rather than every loop iteration -
+		// the device only needs to see it once per interval, not hundreds of times per second.
+		if (now - last_request_time >= std::chrono::milliseconds(DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS)) {
+			requestDeviceInfo();
+			last_request_time = now;
+		}
 
 		// Read in some data from the connection.
 		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
@@ -149,6 +181,9 @@ void Driver::waitForDevicePacket() {
 				// Ensure that you free the an_packet when your done with it or you will leak memory
 				an_packet_free(&an_packet);
 			}
+		} else {
+			// No data available yet - avoid busy-spinning the CPU while waiting.
+			std::this_thread::sleep_for(std::chrono::milliseconds(DEVICE_HANDSHAKE_POLL_SLEEP_MS));
 		}
 	}
 }
