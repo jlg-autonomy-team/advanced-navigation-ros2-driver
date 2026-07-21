@@ -57,6 +57,16 @@
 #include <adnav_interfaces/srv/request_packets.hpp>
 #include <adnav_interfaces/srv/ntrip.hpp>
 #include <adnav_interfaces/msg/llh.hpp>
+// ADV-153: Phase 2 message definitions for lightweight per-packet raw topics
+#include <adnav_interfaces/msg/position_std_dev.hpp>
+#include <adnav_interfaces/msg/velocity_std_dev.hpp>
+#include <adnav_interfaces/msg/euler_std_dev.hpp>
+#include <adnav_interfaces/msg/ned_velocity.hpp>
+#include <adnav_interfaces/msg/body_acceleration.hpp>
+#include <adnav_interfaces/msg/euler_orientation.hpp>
+#include <adnav_interfaces/msg/quaternion_orientation.hpp>
+#include <adnav_interfaces/msg/angular_velocity.hpp>
+#include <adnav_interfaces/msg/angular_acceleration.hpp>
 
 // ROS2 Packages, Services, Messages
 #include <rclcpp/rclcpp.hpp>
@@ -175,10 +185,27 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     sensor_msgs::msg::NavSatFix     nav_fix_msg_;
     sensor_msgs::msg::FluidPressure baro_msg_;
     sensor_msgs::msg::Temperature   temp_msg_;
+    // ADV-153 Phase 3: DEPRECATED - raw NED linear + raw FRD angular, no frame conversion, no
+    // frame documented on the message itself (confirmed broken in the S0 spike). The new pipeline
+    // does not consume this: position/velocity come from pose/ned_velocity, angular rate from the
+    // now frame-correct imu.angular_velocity. Kept only for backwards compatibility with any
+    // existing external subscriber; do not use for anything frame-sensitive. See the design doc
+    // S7 Phase 3 notes.
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
     diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
     diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
+
+    // ADV-153 Phase 3: lightweight per-packet raw messages (packets 24/25/26/35/38/39/40/42/43)
+    adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
+    adnav_interfaces::msg::VelocityStdDev          velocity_std_dev_msg_;
+    adnav_interfaces::msg::EulerStdDev             euler_std_dev_msg_;
+    adnav_interfaces::msg::NedVelocity             ned_velocity_msg_;
+    adnav_interfaces::msg::BodyAcceleration        body_acceleration_msg_;
+    adnav_interfaces::msg::EulerOrientation        euler_orientation_msg_;
+    adnav_interfaces::msg::QuaternionOrientation    quaternion_orientation_msg_;
+    adnav_interfaces::msg::AngularVelocity         angular_velocity_msg_;
+    adnav_interfaces::msg::AngularAcceleration     angular_acceleration_msg_;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             		imu_pub_;
@@ -187,10 +214,22 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr 			magnetic_field_pub_;
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr 			barometric_pressure_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
+    // ADV-153 Phase 3: DEPRECATED, see twist_msg_ above - not fixed, not consumed by the new pipeline.
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
+
+    // ADV-153 Phase 3: lightweight per-packet raw topic publishers
+    rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerStdDev>::SharedPtr           euler_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr      euler_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
 
     // ~~~~~~~~~~~~~~~ Callback handles and parameters
     // Callback groups Allows the callbacks to be processed on a different thread by
@@ -246,6 +285,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void createPublishers();
     void createServices();
     void deviceSetup();
+    void pumpAndLogAcknowledge(const std::string& label);
     void setupParamService();
     void setupParams();
 
@@ -305,6 +345,18 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void ecefPosRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
+
+    // ADV-153 Phase 3: decoders for packets 23/24/25/26/35/38/39/40/42/43
+    void statusRosDecoder(an_packet_t* an_packet);
+    void positionStdDevRosDecoder(an_packet_t* an_packet);
+    void velocityStdDevRosDecoder(an_packet_t* an_packet);
+    void eulerStdDevRosDecoder(an_packet_t* an_packet);
+    void nedVelocityRosDecoder(an_packet_t* an_packet);
+    void bodyAccelRosDecoder(an_packet_t* an_packet);
+    void eulerOrientationRosDecoder(an_packet_t* an_packet);
+    void quaternionOrientRosDecoder(an_packet_t* an_packet);
+    void angularVelRosDecoder(an_packet_t* an_packet);
+    void angularAccelRosDecoder(an_packet_t* an_packet);
 };
 
 }  // namespace adnav
