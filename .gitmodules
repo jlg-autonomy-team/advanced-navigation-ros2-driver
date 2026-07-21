@@ -1,3 +1,4 @@
 [submodule "an-ros-common"]
 	path = an-ros-common
-	url = git@github.com:advanced-navigation/an-ros-common.git
+	url = git@github.com:jlg-autonomy-team/an-ros-common.git
+	branch = ADV-153-integrate-certus-mini-d
