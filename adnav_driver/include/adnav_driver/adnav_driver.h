@@ -110,6 +110,12 @@ constexpr const int    DEFAULT_TIMEOUT = 5;
 constexpr const int    MAX_TIMER_PERIOD = 65535;
 constexpr const int    MIN_TIMER_PERIOD = 1000;
 constexpr const int    MIN_PACKET_PERIOD = 1;
+// ADV-153: waitForDevicePacket() previously busy-spun forever (near 100% CPU) if the device
+// never responded (e.g. wrong baud rate, bad cable, unplugged device) - confirmed on real
+// hardware. These bound that wait with a clear failure instead of an infinite loop.
+constexpr const int    DEVICE_HANDSHAKE_TIMEOUT_SEC = 10;
+constexpr const int    DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS = 500;
+constexpr const int    DEVICE_HANDSHAKE_POLL_SLEEP_MS = 10;
 constexpr const int    MAX_PACKET_PERIOD = 65535;
 constexpr const int    MIN_PORT = 0;
 constexpr const int    MAX_PORT = 65535;
