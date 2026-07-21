@@ -41,9 +41,29 @@ adnav_node:
     #   Freq = 1000000/(Period * Packet Timer Period)
     #   e.g. 10,000 μs Period length and 10 periods per packet gives 10Hz
     # e.g. Requesting Packet 20 with a period of 50 is [20,50]
-    # ADV-153: 20,4 / 28,4 / 33,4 with packet_timer_period=5000 below gives
-    # 1,000,000/(4*5000) = 50Hz per packet, matching publish_us's 50Hz.
-    packet_request: [20, 4, 28, 4, 33, 4]
+    # ADV-153 Phase 3: full packet set for the odom pipeline, all at period=4 (50Hz with
+    # packet_timer_period=5000 below, i.e. 1,000,000/(4*5000), matching publish_us's 50Hz) except
+    # Packet 20, kept at a much lower rate (period=40 -> 5Hz) purely as a UTC timestamp source for
+    # imu_msg_/nav_fix_msg_ headers and a NavSatFix/legacy-twist diagnostic feed - none of its
+    # position/velocity/orientation/status fields are used for the odom pipeline anymore (see the
+    # design doc S2 frame audit + S7 Phase 3). Packets 34 (UTM) and 36 (body velocity) are
+    # deliberately NOT requested (ECEF/33 + NED velocity/35 chosen instead, see S3). Packet 40
+    # (quaternion orientation) is diagnostic-only/not yet frame-corrected - add [40, 4] here if you
+    # want to bench-validate it, but it's not required by the locked-in pipeline.
+    packet_request: [
+      20, 40,   # System State (low-rate: UTC timestamp + legacy NavSatFix/twist only)
+      23, 4,    # Status (system_status/filter_status)
+      24, 4,    # Position Standard Deviation
+      25, 4,    # Velocity Standard Deviation
+      26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance
+      28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
+      33, 4,    # ECEF Position -> pose
+      35, 4,    # NED Velocity
+      38, 4,    # Body Acceleration -> imu.linear_acceleration (FRD->FLU fixed)
+      39, 4,    # Euler Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
+      42, 4,    # Angular Velocity -> imu.angular_velocity (FRD->FLU fixed)
+      43, 4,    # Angular Acceleration (diagnostic only)
+    ]
     
     # The size of the packet period in Microseconds. 
     # Bounded to [1000-65535] [1000Hz-15.29Hz] per the generic ANPP docs, BUT

@@ -209,10 +209,22 @@ void Driver::createPublishers() {
 	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>(std::string(node_name_ + "/magnetic_field"), 10);
 	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>(std::string(node_name_ + "/barometric_pressure"), 10);
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(std::string(node_name_ + "/temperature"), 10);
+	// ADV-153 Phase 3: DEPRECATED topic - see twist_msg_ in adnav_driver.h for why.
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
 	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
 	filter_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/filter_status"), 10);
+
+	// ADV-153 Phase 3: lightweight per-packet raw topics (packets 24/25/26/35/38/39/40/42/43)
+	position_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::PositionStdDev>(std::string(node_name_ + "/position_std_dev"), 10);
+	velocity_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::VelocityStdDev>(std::string(node_name_ + "/velocity_std_dev"), 10);
+	euler_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::EulerStdDev>(std::string(node_name_ + "/euler_std_dev"), 10);
+	ned_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::NedVelocity>(std::string(node_name_ + "/ned_velocity"), 10);
+	body_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::BodyAcceleration>(std::string(node_name_ + "/body_acceleration"), 10);
+	euler_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::EulerOrientation>(std::string(node_name_ + "/euler_orientation"), 10);
+	quaternion_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::QuaternionOrientation>(std::string(node_name_ + "/quaternion_orientation"), 10);
+	angular_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::AngularVelocity>(std::string(node_name_ + "/angular_velocity"), 10);
+	angular_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::AngularAcceleration>(std::string(node_name_ + "/angular_acceleration"), 10);
 }
 
 /**
@@ -272,6 +284,14 @@ void Driver::deviceSetup() {
 	// Create and send a Packet Timer Period Packet.
 	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
 	(void)SendPacketTimer(packet_timer_period_); // Will overwrite acknowledge_receive_ to false
+	// ADV-153: SendPacketTimer()'s built-in AcknowledgeHandler() wait is a no-op this early in the
+	// constructor - nothing decodes incoming bytes until the executor starts spinning
+	// read_timer_'s callback, well after this function returns - so it always instantly returned
+	// stale/meaningless data. Confirmed on real hardware: this bench unit's
+	// packet_timer_period=1000 was silently REJECTED (Acknowledge result=3/failure_range) for
+	// most of a session before anyone noticed, purely because nothing ever checked. Manually pump
+	// a short, bounded read/decode loop here instead to actually catch and log the real result.
+	pumpAndLogAcknowledge("Packet Timer Period");
 
 	// Create and fill a periods format.
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
@@ -285,6 +305,54 @@ void Driver::deviceSetup() {
 	// Since we are not waiting for device acknowledgement at startup
 	acknowledge_recieve_ = true;
 	(void)SendPacketPeriods(packet_periods); // Will overwrite acknowledge_receive_ to false.
+	pumpAndLogAcknowledge("Packet Periods");
+}
+
+/**
+ * @brief Manually pump a short, bounded read/decode loop to catch and log the real Acknowledge
+ * Packet result for a config packet just sent from deviceSetup().
+ *
+ * Needed only for the deviceSetup() call site: it runs synchronously in the constructor, before
+ * the executor (and therefore read_timer_'s callback) starts spinning, so there is nothing else
+ * pumping communicator_->read()/decodePackets() to receive the device's response during that
+ * window. Reuses decodePackets() (which dispatches Acknowledge Packets to acknowledgeDecoder())
+ * so the check-and-log logic here doesn't have to duplicate any ANPP parsing.
+ *
+ * @param label human-readable name of the config just sent, for the log message.
+ */
+void Driver::pumpAndLogAcknowledge(const std::string& label) {
+	an_decoder_t an_decoder;
+	an_decoder_initialise(&an_decoder);
+	acknowledge_recieve_ = false;
+
+	const auto start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500)) {
+		int bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		if (bytes_received > 0) {
+			decodePackets(an_decoder, bytes_received);
+			if (acknowledge_recieve_) {
+				break;
+			}
+		} else {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
+
+	if (!acknowledge_recieve_) {
+		RCLCPP_WARN(this->get_logger(), "%s: no Acknowledge Packet received within 500ms of sending.",
+			label.c_str());
+		return;
+	}
+	if (acknowledge_packet_.acknowledge_result == acknowledge_success) {
+		RCLCPP_INFO(this->get_logger(), "%s: accepted by device.", label.c_str());
+	} else {
+		RCLCPP_ERROR(this->get_logger(),
+			"%s: REJECTED by device (Acknowledge result=%d - see acknowledge_result_e in "
+			"ins_packets.h, e.g. 3=failure_range means a requested value is out of range for this "
+			"specific unit even if within the generic ANPP-documented bounds). The device is still "
+			"running its previous, last-successfully-accepted configuration.",
+			label.c_str(), acknowledge_packet_.acknowledge_result);
+	}
 }
 
 /**
@@ -595,6 +663,17 @@ void Driver::publishTimerCallback() {
 	barometric_pressure_pub_->publish(baro_msg_);
 	temperature_pub_->publish(temp_msg_);
 	pose_pub_->publish(pose_msg_);
+
+	// ADV-153 Phase 3: lightweight per-packet raw topics
+	position_std_dev_pub_->publish(position_std_dev_msg_);
+	velocity_std_dev_pub_->publish(velocity_std_dev_msg_);
+	euler_std_dev_pub_->publish(euler_std_dev_msg_);
+	ned_velocity_pub_->publish(ned_velocity_msg_);
+	body_acceleration_pub_->publish(body_acceleration_msg_);
+	euler_orientation_pub_->publish(euler_orientation_msg_);
+	quaternion_orientation_pub_->publish(quaternion_orientation_msg_);
+	angular_velocity_pub_->publish(angular_velocity_msg_);
+	angular_acceleration_pub_->publish(angular_acceleration_msg_);
 
 	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
 
@@ -1514,6 +1593,37 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
+			// ADV-153 Phase 3: lightweight per-packet raw topics
+			case packet_id_status: statusRosDecoder(an_packet);
+				break;
+
+			case packet_id_position_standard_deviation: positionStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_velocity_standard_deviation: velocityStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_euler_orientation_standard_deviation: eulerStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_ned_velocity: nedVelocityRosDecoder(an_packet);
+				break;
+
+			case packet_id_body_acceleration: bodyAccelRosDecoder(an_packet);
+				break;
+
+			case packet_id_euler_orientation: eulerOrientationRosDecoder(an_packet);
+				break;
+
+			case packet_id_quaternion_orientation: quaternionOrientRosDecoder(an_packet);
+				break;
+
+			case packet_id_angular_velocity: angularVelRosDecoder(an_packet);
+				break;
+
+			case packet_id_angular_acceleration: angularAccelRosDecoder(an_packet);
+				break;
+
 			default:
 				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
 					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
@@ -1585,7 +1695,6 @@ void Driver::deviceInfoDecoder(an_packet_t* an_packet) {
 void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 
 	system_state_packet_t system_state_packet;
-	std::stringstream ss;
 	std::unique_lock<std::mutex> lock(messages_mutex_);
 	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: L\tAccess: %d", P20_num_);
 	// Debug timekeeper
@@ -1636,7 +1745,8 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			if(ntrip_client_.get() != nullptr) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
-			// TWIST
+			// TWIST (DEPRECATED - see twist_msg_ in adnav_driver.h; raw NED/FRD passthrough, no
+			// frame conversion, not consumed by the new pipeline. Left as-is for compatibility.)
 			twist_msg_.linear.x = system_state_packet.velocity[0];
 			twist_msg_.linear.y = system_state_packet.velocity[1];
 			twist_msg_.linear.z = system_state_packet.velocity[2];
@@ -1645,189 +1755,21 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
 
 
-			// IMU
+			// ADV-153 Phase 3: imu_msg_.orientation/angular_velocity/linear_acceleration (and
+			// pose_msg_.orientation) are no longer sourced from Packet 20 here - they now come
+			// from the lightweight Packets 39 (EulerOrientation)/42 (AngularVelocity)/38
+			// (BodyAcceleration) respectively, in eulerOrientationRosDecoder()/angularVelRosDecoder()/
+			// bodyAccelRosDecoder() below, which also apply the FRD->FLU fix. imu_msg_.header.stamp
+			// still comes from here since Packet 20 remains the only packet with a UTC timestamp
+			// requested (kept at low rate for diagnostics/nav_sat_fix per the design doc).
 			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
 			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
 			imu_msg_.header.frame_id = frame_id_;
-			// Using the RPY orientation as done by cosama
-			orientation_.setRPY(
-				system_state_packet.orientation[0],
-				system_state_packet.orientation[1],
-				M_PI/2.0f - system_state_packet.orientation[2] // REP 103
-			);
-			imu_msg_.orientation.x = orientation_[0];
-			imu_msg_.orientation.y = orientation_[1];
-			imu_msg_.orientation.z = orientation_[2];
-			imu_msg_.orientation.w = orientation_[3];
 
-			// POSE Orientation
-			pose_msg_.orientation.x = orientation_[0];
-			pose_msg_.orientation.y = orientation_[1];
-			pose_msg_.orientation.z = orientation_[2];
-			pose_msg_.orientation.w = orientation_[3];
-
-			imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0]; // These the same as the TWIST msg values
-			imu_msg_.angular_velocity.y = system_state_packet.angular_velocity[1];
-			imu_msg_.angular_velocity.z = system_state_packet.angular_velocity[2];
-
-			// The IMU linear acceleration is now coming from the RAW Sensors Accelerometer
-			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[0];
-			imu_msg_.linear_acceleration.y = system_state_packet.body_acceleration[1];
-			imu_msg_.linear_acceleration.z = system_state_packet.body_acceleration[2];
-
-			// SYSTEM STATUS
-			system_status_msg_.message = "";
-			system_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK; // default OK state
-			std::stringstream serial_num;
-			serial_num << std::hex << device_information_packet_.serial_number[0] <<
-				device_information_packet_.serial_number[1] << device_information_packet_.serial_number[2];
-			system_status_msg_.hardware_id = serial_num.str();
-			if (system_state_packet.system_status.b.system_failure) {
-				ss << "\n0. SYSTEM FAILURE DETECTED.";
-			}
-			if (system_state_packet.system_status.b.accelerometer_sensor_failure) {
-				ss << "\n1. ACCELEROMETER SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.gyroscope_sensor_failure) {
-				ss << "\n2. GYROSCOPE SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.magnetometer_sensor_failure) {
-				ss << "\n3. MAGNETOMETER SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.pressure_sensor_failure) {
-				ss << "\n4. PRESSURE SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.gnss_failure) {
-				ss << "\n5. GNSS FAILURE.";
-			}
-			if (system_state_packet.system_status.b.accelerometer_over_range) {
-				ss << "\n6. ACCELEROMETER OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.gyroscope_over_range) {
-				ss << "\n7. GYROSCOPE OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.magnetometer_over_range) {
-				ss << "\n8. MAGNETOMETER OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.pressure_over_range) {
-				ss << "\n9. PRESSURE OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.minimum_temperature_alarm) {
-				ss << "\n10. MINIMUM TEMPERATURE ALARM.";
-			}
-			if (system_state_packet.system_status.b.maximum_temperature_alarm) {
-				ss << "\n11. MAXIMUM TEMPERATURE ALARM.";
-			}
-			if (system_state_packet.system_status.b.internal_data_logging_error) {
-				ss << "\n12. INTERNAL DATA LOGGING ERROR.";
-			}
-			if (system_state_packet.system_status.b.high_voltage_alarm) {
-				ss << "\n13. HIGH VOLTAGE ALARM.";
-			}
-			if (system_state_packet.system_status.b.gnss_antenna_fault) {
-				ss << "\n14. GNSS ANTENNA FAULT.";
-			}
-			if (system_state_packet.system_status.b.serial_port_overflow_alarm) {
-				ss << "\n15. SERIAL PORT DATA OVERFLOW.";
-			}
-
-			// If an error occured log it
-			if(!ss.str().empty()) {
-				ss << std::endl;
-				statusErrLog(ss.str());
-				// empty the stringstream
-				ss.str("");
-			}
-
-			// FILTER STATUS
-			filter_status_msg_.message = "";
-			filter_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK;; // default OK state
-			filter_status_msg_.hardware_id = serial_num.str();
-			if (system_state_packet.filter_status.b.orientation_filter_initialised) {
-				filter_status_msg_.message += "\n0. Orientation Filter Initialised.";
-			}
-			else {
-				 ss << "\n0. Orientation Filter NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.ins_filter_initialised) {
-				filter_status_msg_.message += "\n1. Navigation Filter Initialised.";
-			}
-			else {
-				 ss << "\n1. Navigation Filter NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.heading_initialised) {
-				filter_status_msg_.message += "\n2. Heading Initialised.";
-			}
-			else {
-				 ss << "\n2. Heading NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.utc_time_initialised) {
-				filter_status_msg_.message += "\n3. UTC Time Initialised.";
-			}
-			else {
-				 ss << "\n3. UTC Time NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.event1_flag) {
-				 ss << "\n7. Event 1 Occured.";
-			}
-			else {
-				filter_status_msg_.message += "\n7. Event 1 NOT Occured.";
-			}
-			if (system_state_packet.filter_status.b.event2_flag) {
-				 ss << "\n8. Event 2 Occured.";
-			}
-			else {
-				filter_status_msg_.message += "\n8. Event 2 NOT Occured.";
-			}
-			if (system_state_packet.filter_status.b.internal_gnss_enabled) {
-				filter_status_msg_.message += "\n9. Internal GNSS Enabled.";
-			}
-			else {
-				ss << "\n9. Internal GNSS NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.dual_antenna_heading_active) {
-				filter_status_msg_.message += "\n10. Dual Antenna Heading Active.";
-			}
-			else {
-				ss << "\n10. Dual Antenna Heading NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.velocity_heading_enabled) {
-				filter_status_msg_.message += "\n11. Velocity Heading Enabled.";
-			}
-			else {
-				ss << "\n11. Velocity Heading NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.atmospheric_altitude_enabled) {
-				filter_status_msg_.message += "\n12. Atmospheric Altitude Enabled.";
-			}
-			else {
-				ss << "\n12. Atmospheric Altitude NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.external_position_active) {
-				filter_status_msg_.message += "\n13. External Position Active.";
-			}
-			else {
-				ss << "\n13. External Position NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.external_velocity_active) {
-				filter_status_msg_.message += "\n14. External Velocity Active.";
-			}
-			else {
-				ss << "\n14. External Velocity NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.external_heading_active) {
-				filter_status_msg_.message += "\n15. External Heading Active.";
-			}
-			else {
-				ss << "\n16. External Heading NOT Active.";
-			}
-
-			// If a warning has occued log it
-			if(!ss.str().empty()) {
-				ss << std::endl;
-				statusWarnLog(ss.str());
-				ss.str("");
-			}
+			// ADV-153 Phase 3: system_status_msg_/filter_status_msg_ are no longer built from
+			// Packet 20 here - see statusRosDecoder() (Packet 23) below, which reuses this exact
+			// logic against the lightweight status_packet_t instead of the monolithic
+			// system_state_packet_t.
 	}
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
@@ -1925,12 +1867,15 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 		imu_raw_msg_.header.frame_id = frame_id_;
 		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
+		// ADV-153: FRD->FLU fix (confirmed bug in S0 spike + live bench test: raw passthrough gave
+		// linear_acceleration.z = -9.75 at rest instead of +9.8). Static 180deg rotation about X:
+		// (x, -y, -z).
 		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[0];
-		imu_raw_msg_.linear_acceleration.y = raw_sensors_packet.accelerometers[1];
-		imu_raw_msg_.linear_acceleration.z = raw_sensors_packet.accelerometers[2];
+		imu_raw_msg_.linear_acceleration.y = -raw_sensors_packet.accelerometers[1];
+		imu_raw_msg_.linear_acceleration.z = -raw_sensors_packet.accelerometers[2];
 		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[0];
-		imu_raw_msg_.angular_velocity.y = raw_sensors_packet.gyroscopes[1];
-		imu_raw_msg_.angular_velocity.z = raw_sensors_packet.gyroscopes[2];
+		imu_raw_msg_.angular_velocity.y = -raw_sensors_packet.gyroscopes[1];
+		imu_raw_msg_.angular_velocity.z = -raw_sensors_packet.gyroscopes[2];
 
 		// BAROMETRIC PRESSURE
 		baro_msg_.header.frame_id = frame_id_;
@@ -1950,7 +1895,455 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
 }
 
+// ADV-153 Phase 3: decoders for packets 23/24/25/26/35/38/39/40/42/43.
 
+/**
+ * @brief Function to decode the Status ANPP Packet (ANPP.23).
+ *
+ * Lightweight replacement for reading System Status / Filter Status off Packet 20 - same two
+ * bitfields, without the position/velocity/orientation payload. Rebuilds system_status_msg_ /
+ * filter_status_msg_ (the human-readable diagnostic_msgs/DiagnosticStatus topics) the same way
+ * systemStateRosDecoder() used to, just sourced from status_packet_t instead of
+ * system_state_packet_t.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::statusRosDecoder(an_packet_t* an_packet) {
+	status_packet_t status_packet;
+	std::stringstream ss;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+	auto time = this->get_clock().get()->now().nanoseconds();
+
+	if (decode_status_packet(&status_packet, an_packet) == 0) {
+		// SYSTEM STATUS
+		system_status_msg_.message = "";
+		system_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK; // default OK state
+		std::stringstream serial_num;
+		serial_num << std::hex << device_information_packet_.serial_number[0] <<
+			device_information_packet_.serial_number[1] << device_information_packet_.serial_number[2];
+		system_status_msg_.hardware_id = serial_num.str();
+		if (status_packet.system_status.b.system_failure) {
+			ss << "\n0. SYSTEM FAILURE DETECTED.";
+		}
+		if (status_packet.system_status.b.accelerometer_sensor_failure) {
+			ss << "\n1. ACCELEROMETER SENSOR FAILURE.";
+		}
+		if (status_packet.system_status.b.gyroscope_sensor_failure) {
+			ss << "\n2. GYROSCOPE SENSOR FAILURE.";
+		}
+		if (status_packet.system_status.b.magnetometer_sensor_failure) {
+			ss << "\n3. MAGNETOMETER SENSOR FAILURE.";
+		}
+		if (status_packet.system_status.b.pressure_sensor_failure) {
+			ss << "\n4. PRESSURE SENSOR FAILURE.";
+		}
+		if (status_packet.system_status.b.gnss_failure) {
+			ss << "\n5. GNSS FAILURE.";
+		}
+		if (status_packet.system_status.b.accelerometer_over_range) {
+			ss << "\n6. ACCELEROMETER OVER RANGE.";
+		}
+		if (status_packet.system_status.b.gyroscope_over_range) {
+			ss << "\n7. GYROSCOPE OVER RANGE.";
+		}
+		if (status_packet.system_status.b.magnetometer_over_range) {
+			ss << "\n8. MAGNETOMETER OVER RANGE.";
+		}
+		if (status_packet.system_status.b.pressure_over_range) {
+			ss << "\n9. PRESSURE OVER RANGE.";
+		}
+		if (status_packet.system_status.b.minimum_temperature_alarm) {
+			ss << "\n10. MINIMUM TEMPERATURE ALARM.";
+		}
+		if (status_packet.system_status.b.maximum_temperature_alarm) {
+			ss << "\n11. MAXIMUM TEMPERATURE ALARM.";
+		}
+		if (status_packet.system_status.b.internal_data_logging_error) {
+			ss << "\n12. INTERNAL DATA LOGGING ERROR.";
+		}
+		if (status_packet.system_status.b.high_voltage_alarm) {
+			ss << "\n13. HIGH VOLTAGE ALARM.";
+		}
+		// Note: this field is named gnss_antenna_disconnected in status_packet_t (packet 23) vs
+		// gnss_antenna_fault in system_state_packet_t (packet 20) - same bit position (14), just
+		// an inconsistent name in the vendored an-ros-common header.
+		if (status_packet.system_status.b.gnss_antenna_disconnected) {
+			ss << "\n14. GNSS ANTENNA FAULT.";
+		}
+		if (status_packet.system_status.b.serial_port_overflow_alarm) {
+			ss << "\n15. SERIAL PORT DATA OVERFLOW.";
+		}
+
+		// If an error occured log it
+		if (!ss.str().empty()) {
+			ss << std::endl;
+			statusErrLog(ss.str());
+			ss.str("");
+		}
+
+		// FILTER STATUS
+		filter_status_msg_.message = "";
+		filter_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK; // default OK state
+		filter_status_msg_.hardware_id = serial_num.str();
+		if (status_packet.filter_status.b.orientation_filter_initialised) {
+			filter_status_msg_.message += "\n0. Orientation Filter Initialised.";
+		} else {
+			ss << "\n0. Orientation Filter NOT Initialised.";
+		}
+		if (status_packet.filter_status.b.ins_filter_initialised) {
+			filter_status_msg_.message += "\n1. Navigation Filter Initialised.";
+		} else {
+			ss << "\n1. Navigation Filter NOT Initialised.";
+		}
+		if (status_packet.filter_status.b.heading_initialised) {
+			filter_status_msg_.message += "\n2. Heading Initialised.";
+		} else {
+			ss << "\n2. Heading NOT Initialised.";
+		}
+		if (status_packet.filter_status.b.utc_time_initialised) {
+			filter_status_msg_.message += "\n3. UTC Time Initialised.";
+		} else {
+			ss << "\n3. UTC Time NOT Initialised.";
+		}
+		if (status_packet.filter_status.b.event1_flag) {
+			ss << "\n7. Event 1 Occured.";
+		} else {
+			filter_status_msg_.message += "\n7. Event 1 NOT Occured.";
+		}
+		if (status_packet.filter_status.b.event2_flag) {
+			ss << "\n8. Event 2 Occured.";
+		} else {
+			filter_status_msg_.message += "\n8. Event 2 NOT Occured.";
+		}
+		if (status_packet.filter_status.b.internal_gnss_enabled) {
+			filter_status_msg_.message += "\n9. Internal GNSS Enabled.";
+		} else {
+			ss << "\n9. Internal GNSS NOT Enabled.";
+		}
+		if (status_packet.filter_status.b.dual_antenna_heading_active) {
+			filter_status_msg_.message += "\n10. Dual Antenna Heading Active.";
+		} else {
+			ss << "\n10. Dual Antenna Heading NOT Active.";
+		}
+		if (status_packet.filter_status.b.velocity_heading_enabled) {
+			filter_status_msg_.message += "\n11. Velocity Heading Enabled.";
+		} else {
+			ss << "\n11. Velocity Heading NOT Enabled.";
+		}
+		if (status_packet.filter_status.b.atmospheric_altitude_enabled) {
+			filter_status_msg_.message += "\n12. Atmospheric Altitude Enabled.";
+		} else {
+			ss << "\n12. Atmospheric Altitude NOT Enabled.";
+		}
+		if (status_packet.filter_status.b.external_position_active) {
+			filter_status_msg_.message += "\n13. External Position Active.";
+		} else {
+			ss << "\n13. External Position NOT Active.";
+		}
+		if (status_packet.filter_status.b.external_velocity_active) {
+			filter_status_msg_.message += "\n14. External Velocity Active.";
+		} else {
+			ss << "\n14. External Velocity NOT Active.";
+		}
+		if (status_packet.filter_status.b.external_heading_active) {
+			filter_status_msg_.message += "\n15. External Heading Active.";
+		} else {
+			ss << "\n16. External Heading NOT Active.";
+		}
+
+		// If a warning has occured log it
+		if (!ss.str().empty()) {
+			ss << std::endl;
+			statusWarnLog(ss.str());
+			ss.str("");
+		}
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+	auto diff = this->get_clock().get()->now().nanoseconds() - time;
+	RCLCPP_DEBUG(this->get_logger(), "Packet 23:\tMutex: U\tTimeLocked: %ld μs", diff/1000);
+}
+
+/**
+ * @brief Function to decode the Position Standard Deviation ANPP Packet (ANPP.24).
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::positionStdDevRosDecoder(an_packet_t* an_packet) {
+	position_standard_deviation_packet_t position_standard_deviation_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_position_standard_deviation_packet(&position_standard_deviation_packet, an_packet) == 0) {
+		position_std_dev_msg_.header.stamp = this->get_clock()->now();
+		position_std_dev_msg_.header.frame_id = frame_id_;
+		position_std_dev_msg_.anpp_header.header_lrc = an_packet->header[0];
+		position_std_dev_msg_.anpp_header.id = an_packet->id;
+		position_std_dev_msg_.anpp_header.length = an_packet->length;
+		position_std_dev_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		position_std_dev_msg_.standard_deviation.latitude = position_standard_deviation_packet.standard_deviation[0];
+		position_std_dev_msg_.standard_deviation.longitude = position_standard_deviation_packet.standard_deviation[1];
+		position_std_dev_msg_.standard_deviation.height = position_standard_deviation_packet.standard_deviation[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Velocity Standard Deviation ANPP Packet (ANPP.25).
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::velocityStdDevRosDecoder(an_packet_t* an_packet) {
+	velocity_standard_deviation_packet_t velocity_standard_deviation_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_velocity_standard_deviation_packet(&velocity_standard_deviation_packet, an_packet) == 0) {
+		velocity_std_dev_msg_.header.stamp = this->get_clock()->now();
+		velocity_std_dev_msg_.header.frame_id = frame_id_;
+		velocity_std_dev_msg_.anpp_header.header_lrc = an_packet->header[0];
+		velocity_std_dev_msg_.anpp_header.id = an_packet->id;
+		velocity_std_dev_msg_.anpp_header.length = an_packet->length;
+		velocity_std_dev_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native NED nav frame - intentionally not rotated here, see NedVelocity.msg / the design doc.
+		velocity_std_dev_msg_.standard_deviation.north = velocity_standard_deviation_packet.standard_deviation[0];
+		velocity_std_dev_msg_.standard_deviation.east = velocity_standard_deviation_packet.standard_deviation[1];
+		velocity_std_dev_msg_.standard_deviation.down = velocity_standard_deviation_packet.standard_deviation[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Euler Orientation Standard Deviation ANPP Packet (ANPP.26).
+ *
+ * Also wires the roll/pitch/heading variance directly into imu_msg_.orientation_covariance's
+ * diagonal (indices 0/4/8 of the row-major 3x3 matrix) - same frame, no rotation needed since the
+ * NED->ENU yaw sign flip applied to the mean heading does not change its variance.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::eulerStdDevRosDecoder(an_packet_t* an_packet) {
+	euler_orientation_standard_deviation_packet_t euler_orientation_standard_deviation_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_euler_orientation_standard_deviation_packet(&euler_orientation_standard_deviation_packet, an_packet) == 0) {
+		euler_std_dev_msg_.header.stamp = this->get_clock()->now();
+		euler_std_dev_msg_.header.frame_id = frame_id_;
+		euler_std_dev_msg_.anpp_header.header_lrc = an_packet->header[0];
+		euler_std_dev_msg_.anpp_header.id = an_packet->id;
+		euler_std_dev_msg_.anpp_header.length = an_packet->length;
+		euler_std_dev_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		euler_std_dev_msg_.standard_deviation.roll = euler_orientation_standard_deviation_packet.standard_deviation[0];
+		euler_std_dev_msg_.standard_deviation.pitch = euler_orientation_standard_deviation_packet.standard_deviation[1];
+		euler_std_dev_msg_.standard_deviation.heading = euler_orientation_standard_deviation_packet.standard_deviation[2];
+
+		imu_msg_.orientation_covariance[0] = pow(euler_orientation_standard_deviation_packet.standard_deviation[0], 2);
+		imu_msg_.orientation_covariance[4] = pow(euler_orientation_standard_deviation_packet.standard_deviation[1], 2);
+		imu_msg_.orientation_covariance[8] = pow(euler_orientation_standard_deviation_packet.standard_deviation[2], 2);
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the NED Velocity ANPP Packet (ANPP.35).
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::nedVelocityRosDecoder(an_packet_t* an_packet) {
+	ned_velocity_packet_t ned_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_ned_velocity_packet(&ned_velocity_packet, an_packet) == 0) {
+		ned_velocity_msg_.header.stamp = this->get_clock()->now();
+		ned_velocity_msg_.header.frame_id = frame_id_;
+		ned_velocity_msg_.anpp_header.header_lrc = an_packet->header[0];
+		ned_velocity_msg_.anpp_header.id = an_packet->id;
+		ned_velocity_msg_.anpp_header.length = an_packet->length;
+		ned_velocity_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native NED nav frame - intentionally not rotated here. The Option A bridge package
+		// rotates this together with velocity_std_dev's covariance in a single operation, using
+		// the current orientation, so the mean and covariance can never end up inconsistent.
+		ned_velocity_msg_.velocity.north = ned_velocity_packet.velocity[0];
+		ned_velocity_msg_.velocity.east = ned_velocity_packet.velocity[1];
+		ned_velocity_msg_.velocity.down = ned_velocity_packet.velocity[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Body Acceleration ANPP Packet (ANPP.38).
+ *
+ * Also feeds imu_msg_.linear_acceleration with the FRD->FLU fix applied (confirmed bug, S0 spike):
+ * static 180deg rotation about X, (x, -y, -z).
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::bodyAccelRosDecoder(an_packet_t* an_packet) {
+	body_acceleration_packet_t body_acceleration_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_body_acceleration_packet(&body_acceleration_packet, an_packet) == 0) {
+		body_acceleration_msg_.header.stamp = this->get_clock()->now();
+		body_acceleration_msg_.header.frame_id = frame_id_;
+		body_acceleration_msg_.anpp_header.header_lrc = an_packet->header[0];
+		body_acceleration_msg_.anpp_header.id = an_packet->id;
+		body_acceleration_msg_.anpp_header.length = an_packet->length;
+		body_acceleration_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native FRD frame, unflipped - raw/diagnostic topic.
+		body_acceleration_msg_.body_acceleration.x = body_acceleration_packet.acceleration[0];
+		body_acceleration_msg_.body_acceleration.y = body_acceleration_packet.acceleration[1];
+		body_acceleration_msg_.body_acceleration.z = body_acceleration_packet.acceleration[2];
+		body_acceleration_msg_.g_force = body_acceleration_packet.g_force;
+
+		// imu_msg_: FRD->FLU fix applied.
+		imu_msg_.linear_acceleration.x = body_acceleration_packet.acceleration[0];
+		imu_msg_.linear_acceleration.y = -body_acceleration_packet.acceleration[1];
+		imu_msg_.linear_acceleration.z = -body_acceleration_packet.acceleration[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Euler Orientation ANPP Packet (ANPP.39).
+ *
+ * Also computes the shared orientation_ quaternion (roll/pitch unchanged, yaw_enu = pi/2 - heading
+ * per REP103, moved here from systemStateRosDecoder()) and feeds imu_msg_.orientation and
+ * pose_msg_.orientation.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
+	euler_orientation_packet_t euler_orientation_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_euler_orientation_packet(&euler_orientation_packet, an_packet) == 0) {
+		euler_orientation_msg_.header.stamp = this->get_clock()->now();
+		euler_orientation_msg_.header.frame_id = frame_id_;
+		euler_orientation_msg_.anpp_header.header_lrc = an_packet->header[0];
+		euler_orientation_msg_.anpp_header.id = an_packet->id;
+		euler_orientation_msg_.anpp_header.length = an_packet->length;
+		euler_orientation_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native NED body->nav convention, unremapped - raw/diagnostic topic.
+		euler_orientation_msg_.orientation.roll = euler_orientation_packet.orientation[0];
+		euler_orientation_msg_.orientation.pitch = euler_orientation_packet.orientation[1];
+		euler_orientation_msg_.orientation.heading = euler_orientation_packet.orientation[2];
+
+		// Using the RPY orientation as done by cosama (moved from systemStateRosDecoder/Packet 20)
+		orientation_.setRPY(
+			euler_orientation_packet.orientation[0],
+			euler_orientation_packet.orientation[1],
+			M_PI/2.0f - euler_orientation_packet.orientation[2] // REP 103
+		);
+		imu_msg_.orientation.x = orientation_[0];
+		imu_msg_.orientation.y = orientation_[1];
+		imu_msg_.orientation.z = orientation_[2];
+		imu_msg_.orientation.w = orientation_[3];
+
+		pose_msg_.orientation.x = orientation_[0];
+		pose_msg_.orientation.y = orientation_[1];
+		pose_msg_.orientation.z = orientation_[2];
+		pose_msg_.orientation.w = orientation_[3];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Quaternion Orientation ANPP Packet (ANPP.40).
+ *
+ * NOT frame-corrected - published for diagnostics/future validation only, see
+ * QuaternionOrientation.msg. The device transmits QS/QX/QY/QZ scalar-first; mapped here to the
+ * scalar-last geometry_msgs/Quaternion (QS->w, QX->x, QY->y, QZ->z).
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::quaternionOrientRosDecoder(an_packet_t* an_packet) {
+	quaternion_orientation_packet_t quaternion_orientation_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_quaternion_orientation_packet(&quaternion_orientation_packet, an_packet) == 0) {
+		quaternion_orientation_msg_.header.stamp = this->get_clock()->now();
+		quaternion_orientation_msg_.header.frame_id = frame_id_;
+		quaternion_orientation_msg_.anpp_header.header_lrc = an_packet->header[0];
+		quaternion_orientation_msg_.anpp_header.id = an_packet->id;
+		quaternion_orientation_msg_.anpp_header.length = an_packet->length;
+		quaternion_orientation_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		quaternion_orientation_msg_.orientation.w = quaternion_orientation_packet.orientation[0];
+		quaternion_orientation_msg_.orientation.x = quaternion_orientation_packet.orientation[1];
+		quaternion_orientation_msg_.orientation.y = quaternion_orientation_packet.orientation[2];
+		quaternion_orientation_msg_.orientation.z = quaternion_orientation_packet.orientation[3];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Angular Velocity ANPP Packet (ANPP.42).
+ *
+ * Also feeds imu_msg_.angular_velocity with the FRD->FLU fix applied: (x, -y, -z).
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::angularVelRosDecoder(an_packet_t* an_packet) {
+	angular_velocity_packet_t angular_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_angular_velocity_packet(&angular_velocity_packet, an_packet) == 0) {
+		angular_velocity_msg_.header.stamp = this->get_clock()->now();
+		angular_velocity_msg_.header.frame_id = frame_id_;
+		angular_velocity_msg_.anpp_header.header_lrc = an_packet->header[0];
+		angular_velocity_msg_.anpp_header.id = an_packet->id;
+		angular_velocity_msg_.anpp_header.length = an_packet->length;
+		angular_velocity_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native FRD frame, unflipped - raw/diagnostic topic.
+		angular_velocity_msg_.angular_velocity.x = angular_velocity_packet.angular_velocity[0];
+		angular_velocity_msg_.angular_velocity.y = angular_velocity_packet.angular_velocity[1];
+		angular_velocity_msg_.angular_velocity.z = angular_velocity_packet.angular_velocity[2];
+
+		// imu_msg_: FRD->FLU fix applied.
+		imu_msg_.angular_velocity.x = angular_velocity_packet.angular_velocity[0];
+		imu_msg_.angular_velocity.y = -angular_velocity_packet.angular_velocity[1];
+		imu_msg_.angular_velocity.z = -angular_velocity_packet.angular_velocity[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the Angular Acceleration ANPP Packet (ANPP.43).
+ *
+ * Published raw (native FRD, unflipped) for diagnostics - not consumed elsewhere in the locked-in
+ * pipeline.
+ *
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::angularAccelRosDecoder(an_packet_t* an_packet) {
+	angular_acceleration_packet_t angular_acceleration_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_angular_acceleration_packet(&angular_acceleration_packet, an_packet) == 0) {
+		angular_acceleration_msg_.header.stamp = this->get_clock()->now();
+		angular_acceleration_msg_.header.frame_id = frame_id_;
+		angular_acceleration_msg_.anpp_header.header_lrc = an_packet->header[0];
+		angular_acceleration_msg_.anpp_header.id = an_packet->id;
+		angular_acceleration_msg_.anpp_header.length = an_packet->length;
+		angular_acceleration_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		angular_acceleration_msg_.angular_acceleration.x = angular_acceleration_packet.angular_acceleration[0];
+		angular_acceleration_msg_.angular_acceleration.y = angular_acceleration_packet.angular_acceleration[1];
+		angular_acceleration_msg_.angular_acceleration.z = angular_acceleration_packet.angular_acceleration[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
 
 }// namespace adnav
 
