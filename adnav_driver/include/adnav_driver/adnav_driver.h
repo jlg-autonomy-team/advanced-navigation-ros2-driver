@@ -57,7 +57,7 @@
 #include <adnav_interfaces/srv/request_packets.hpp>
 #include <adnav_interfaces/srv/ntrip.hpp>
 #include <adnav_interfaces/msg/llh.hpp>
-// ADV-153: Phase 2 message definitions for lightweight per-packet raw topics
+// ADV-153: Phase 3 message definitions for lightweight per-packet raw topics
 #include <adnav_interfaces/msg/position_std_dev.hpp>
 #include <adnav_interfaces/msg/velocity_std_dev.hpp>
 #include <adnav_interfaces/msg/euler_std_dev.hpp>
