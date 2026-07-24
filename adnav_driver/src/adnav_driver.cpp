@@ -2057,7 +2057,7 @@ void Driver::statusRosDecoder(an_packet_t* an_packet) {
 			ss << "\n15. SERIAL PORT DATA OVERFLOW.";
 		}
 
-		// If an error occured log it
+		// If an error occurred log it
 		if (!ss.str().empty()) {
 			ss << std::endl;
 			statusErrLog(ss.str());
