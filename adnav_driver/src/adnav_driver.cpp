@@ -270,7 +270,18 @@ void Driver::createServices() {
 			std::placeholders::_2),
 		rmw_qos_profile_services_default,
 		service_group_);
+
+	installation_alignment_srv_ = this->create_service<adnav_interfaces::srv::InstallationAlignment>(
+		(node_name_ + "/installation_alignment"),
+		std::bind(
+			&Driver::srvInstallationAlignment,
+			this,
+			std::placeholders::_1,
+			std::placeholders::_2),
+		rmw_qos_profile_services_default,
+		service_group_);
 }
+
 
 /**
  * @brief Method to push requested configuration to the device.
@@ -949,6 +960,30 @@ void Driver::srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Reques
 
 }
 
+/**
+ * @brief Service to request a new Installation Alignment (ANPP 185) be sent to the device -
+ * a fixed roll/pitch offset correcting for the sensor's physical mounting tilt (yaw offset is
+ * always sent as 0 - see InstallationAlignment.srv for the full rationale).
+ *
+ * @param request Const shared pointer to an InstallationAlignment Request msg.
+ * @param response Shared pointer to an InstallationAlignment Response.
+ */
+void Driver::srvInstallationAlignment(
+		const std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Request> request,
+		std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Response> response) {
+
+	RCLCPP_INFO(this->get_logger(),
+		"Installation Alignment Service Called:\n\tRoll: %f\n\tPitch: %f\n\tPermanent: %d",
+		request->roll, request->pitch, request->permanent);
+
+	response->acknowledgement = SendInstallationAlignment(request->roll, request->pitch, request->permanent);
+
+	char buf[15];
+	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
+	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
+            response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
+}
+
 //~~~~~~ Parameter Functions
 
 /**
@@ -1546,6 +1581,54 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 
 	RCLCPP_INFO(this->get_logger(), "Sending Packet Periods Request to device.");
 	an_packet = encode_packet_periods_packet(&packet_periods_packet);
+	encodeAndSend(an_packet);
+
+	return AcknowledgeHandler();
+}
+
+/**
+ * @brief Function to send an Installation Alignment Packet (ANPP 185) to the device and await
+ * the acknowledgement.
+ *
+ * ADV-153: only ever sets a roll/pitch offset (yaw offset always 0) - see
+ * an-ros-common/srv/InstallationAlignment.srv for the full rationale. The alignment DCM is built
+ * from roll/pitch only, using the standard aerospace R = Rz(0) * Ry(pitch) * Rx(roll) convention.
+ * GNSS antenna/odometer/external-data offsets are not currently configurable through this
+ * service and are sent as all-zero (matches the device's own un-configured default).
+ *
+ * @param roll Roll offset in radians (rotation about the vehicle's forward/X axis).
+ * @param pitch Pitch offset in radians (rotation about the vehicle's left/Y axis).
+ * @param permanent Boolean value for overwriting configuration memory. Default = True.
+ * @return acknowledgement Message
+ */
+adnav_interfaces::msg::RawAcknowledge Driver::SendInstallationAlignment(double roll, double pitch, bool permanent) {
+	RCLCPP_INFO(this->get_logger(),
+		"Sending Installation Alignment Request to device (roll=%f, pitch=%f, permanent=%d).",
+		roll, pitch, permanent);
+
+	installation_alignment_packet_t installation_alignment_packet;
+	an_packet_t *an_packet;
+
+	memset(&installation_alignment_packet, 0, sizeof(installation_alignment_packet));
+	installation_alignment_packet.permanent = permanent;
+
+	const float cr = static_cast<float>(cos(roll));
+	const float sr = static_cast<float>(sin(roll));
+	const float cp = static_cast<float>(cos(pitch));
+	const float sp = static_cast<float>(sin(pitch));
+
+	// R = Rz(0) * Ry(pitch) * Rx(roll)
+	installation_alignment_packet.alignment_dcm[0][0] = cp;
+	installation_alignment_packet.alignment_dcm[0][1] = sp * sr;
+	installation_alignment_packet.alignment_dcm[0][2] = sp * cr;
+	installation_alignment_packet.alignment_dcm[1][0] = 0.0f;
+	installation_alignment_packet.alignment_dcm[1][1] = cr;
+	installation_alignment_packet.alignment_dcm[1][2] = -sr;
+	installation_alignment_packet.alignment_dcm[2][0] = -sp;
+	installation_alignment_packet.alignment_dcm[2][1] = cp * sr;
+	installation_alignment_packet.alignment_dcm[2][2] = cp * cr;
+
+	an_packet = encode_installation_alignment_packet(&installation_alignment_packet);
 	encodeAndSend(an_packet);
 
 	return AcknowledgeHandler();

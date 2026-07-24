@@ -56,6 +56,7 @@
 #include <adnav_interfaces/srv/packet_timer_period.hpp>
 #include <adnav_interfaces/srv/request_packets.hpp>
 #include <adnav_interfaces/srv/ntrip.hpp>
+#include <adnav_interfaces/srv/installation_alignment.hpp>
 #include <adnav_interfaces/msg/llh.hpp>
 // ADV-153: Phase 2 message definitions for lightweight per-packet raw topics
 #include <adnav_interfaces/msg/position_std_dev.hpp>
@@ -260,6 +261,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Service<std_srvs::srv::Empty>::SharedPtr restart_read_srv_;
     rclcpp::Service<adnav_interfaces::srv::RequestPackets>::SharedPtr request_packet_srv_;
     rclcpp::Service<adnav_interfaces::srv::Ntrip>::SharedPtr ntrip_srv_;
+    rclcpp::Service<adnav_interfaces::srv::InstallationAlignment>::SharedPtr installation_alignment_srv_;
 
     // Threading variables
     std::mutex messages_mutex_;
@@ -309,6 +311,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
         std::shared_ptr<adnav_interfaces::srv::RequestPackets::Response> response);
     void srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Request> request,
         std::shared_ptr<adnav_interfaces::srv::Ntrip::Response> response);
+    void srvInstallationAlignment(
+        const std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Request> request,
+        std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Response> response);
 
     //~~~~~~ Parameter Functions
     rcl_interfaces::msg::SetParametersResult ParamSetCallback(const std::vector<rclcpp::Parameter>& Params);
@@ -336,6 +341,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
         bool clear_existing = true, bool permanent = true);
+    // ADV-153: sends an Installation Alignment Packet (ANPP 185) built from a roll/pitch offset
+    // only (yaw offset always 0 - see InstallationAlignment.srv for the full rationale).
+    adnav_interfaces::msg::RawAcknowledge SendInstallationAlignment(double roll, double pitch, bool permanent = true);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
