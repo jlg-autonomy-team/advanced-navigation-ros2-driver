@@ -61,11 +61,13 @@
 // ADV-153: Phase 3 message definitions for lightweight per-packet raw topics
 #include <adnav_interfaces/msg/position_std_dev.hpp>
 #include <adnav_interfaces/msg/velocity_std_dev.hpp>
+#include <adnav_interfaces/msg/quaternion_std_dev.hpp>
 #include <adnav_interfaces/msg/euler_std_dev.hpp>
+#include <adnav_interfaces/msg/body_velocity.hpp>
 #include <adnav_interfaces/msg/ned_velocity.hpp>
 #include <adnav_interfaces/msg/body_acceleration.hpp>
-#include <adnav_interfaces/msg/euler_orientation.hpp>
 #include <adnav_interfaces/msg/quaternion_orientation.hpp>
+#include <adnav_interfaces/msg/euler_orientation.hpp>
 #include <adnav_interfaces/msg/angular_velocity.hpp>
 #include <adnav_interfaces/msg/angular_acceleration.hpp>
 
@@ -200,12 +202,14 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153 Phase 3: lightweight per-packet raw messages (packets 24/25/26/35/38/39/40/42/43)
     adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
     adnav_interfaces::msg::VelocityStdDev          velocity_std_dev_msg_;
-    adnav_interfaces::msg::EulerStdDev             euler_std_dev_msg_;
-    adnav_interfaces::msg::NedVelocity             ned_velocity_msg_;
+    adnav_interfaces::msg::QuaternionStdDev         quaternion_std_dev_msg_;
+    adnav_interfaces::msg::EulerStdDev              euler_std_dev_msg_;
+    adnav_interfaces::msg::BodyVelocity             body_velocity_msg_;
     adnav_interfaces::msg::BodyAcceleration        body_acceleration_msg_;
-    adnav_interfaces::msg::EulerOrientation        euler_orientation_msg_;
     adnav_interfaces::msg::QuaternionOrientation    quaternion_orientation_msg_;
+    adnav_interfaces::msg::EulerOrientation         euler_orientation_msg_;
     adnav_interfaces::msg::AngularVelocity         angular_velocity_msg_;
+    adnav_interfaces::msg::NedVelocity             ned_velocity_msg_;
     adnav_interfaces::msg::AngularAcceleration     angular_acceleration_msg_;
 
     // Publishers
@@ -224,10 +228,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153 Phase 3: lightweight per-packet raw topic publishers
     rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::EulerStdDev>::SharedPtr           euler_std_dev_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::QuaternionStdDev>::SharedPtr      quaternion_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::BodyVelocity>::SharedPtr          body_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr      euler_orientation_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
@@ -350,21 +353,22 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
-    void ecefPosRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
 
-    // ADV-153 Phase 3: decoders for packets 23/24/25/26/35/38/39/40/42/43
+    // ADV-153 Phase 3: decoders for packets 23/24/25/26/27/35/38/39/40/42/43
     void statusRosDecoder(an_packet_t* an_packet);
     void positionStdDevRosDecoder(an_packet_t* an_packet);
     void velocityStdDevRosDecoder(an_packet_t* an_packet);
-    void eulerStdDevRosDecoder(an_packet_t* an_packet);
-    void nedVelocityRosDecoder(an_packet_t* an_packet);
+    void bodyVelocityRosDecoder(an_packet_t* an_packet);
     void bodyAccelRosDecoder(an_packet_t* an_packet);
-    void eulerOrientationRosDecoder(an_packet_t* an_packet);
     void quaternionOrientRosDecoder(an_packet_t* an_packet);
     void angularVelRosDecoder(an_packet_t* an_packet);
     void angularAccelRosDecoder(an_packet_t* an_packet);
+    void eulerStdDevRosDecoder(an_packet_t* an_packet);
+    void eulerOrientationRosDecoder(an_packet_t* an_packet);
+    void ecefPosRosDecoder(an_packet_t* an_packet);
+    void nedVelocityRosDecoder(an_packet_t* an_packet);
 };
 
 }  // namespace adnav

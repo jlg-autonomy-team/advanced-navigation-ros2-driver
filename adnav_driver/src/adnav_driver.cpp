@@ -218,10 +218,9 @@ void Driver::createPublishers() {
 	// ADV-153 Phase 3: lightweight per-packet raw topics (packets 24/25/26/35/38/39/40/42/43)
 	position_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::PositionStdDev>(std::string(node_name_ + "/position_std_dev"), 10);
 	velocity_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::VelocityStdDev>(std::string(node_name_ + "/velocity_std_dev"), 10);
-	euler_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::EulerStdDev>(std::string(node_name_ + "/euler_std_dev"), 10);
-	ned_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::NedVelocity>(std::string(node_name_ + "/ned_velocity"), 10);
+	quaternion_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::QuaternionStdDev>(std::string(node_name_ + "/quaternion_std_dev"), 10);
+	body_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::BodyVelocity>(std::string(node_name_ + "/body_velocity"), 10);
 	body_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::BodyAcceleration>(std::string(node_name_ + "/body_acceleration"), 10);
-	euler_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::EulerOrientation>(std::string(node_name_ + "/euler_orientation"), 10);
 	quaternion_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::QuaternionOrientation>(std::string(node_name_ + "/quaternion_orientation"), 10);
 	angular_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::AngularVelocity>(std::string(node_name_ + "/angular_velocity"), 10);
 	angular_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::AngularAcceleration>(std::string(node_name_ + "/angular_acceleration"), 10);
@@ -678,10 +677,9 @@ void Driver::publishTimerCallback() {
 	// ADV-153 Phase 3: lightweight per-packet raw topics
 	position_std_dev_pub_->publish(position_std_dev_msg_);
 	velocity_std_dev_pub_->publish(velocity_std_dev_msg_);
-	euler_std_dev_pub_->publish(euler_std_dev_msg_);
-	ned_velocity_pub_->publish(ned_velocity_msg_);
+	quaternion_std_dev_pub_->publish(quaternion_std_dev_msg_);
+	body_velocity_pub_->publish(body_velocity_msg_);
 	body_acceleration_pub_->publish(body_acceleration_msg_);
-	euler_orientation_pub_->publish(euler_orientation_msg_);
 	quaternion_orientation_pub_->publish(quaternion_orientation_msg_);
 	angular_velocity_pub_->publish(angular_velocity_msg_);
 	angular_acceleration_pub_->publish(angular_acceleration_msg_);
@@ -1667,9 +1665,6 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
 				break;
 
-			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
-				break;
-
 			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
 				break;
 
@@ -1686,16 +1681,10 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_velocity_standard_deviation: velocityStdDevRosDecoder(an_packet);
 				break;
 
-			case packet_id_euler_orientation_standard_deviation: eulerStdDevRosDecoder(an_packet);
-				break;
-
-			case packet_id_ned_velocity: nedVelocityRosDecoder(an_packet);
+			case packet_id_body_velocity: bodyVelocityRosDecoder(an_packet);
 				break;
 
 			case packet_id_body_acceleration: bodyAccelRosDecoder(an_packet);
-				break;
-
-			case packet_id_euler_orientation: eulerOrientationRosDecoder(an_packet);
 				break;
 
 			case packet_id_quaternion_orientation: quaternionOrientRosDecoder(an_packet);
@@ -2229,6 +2218,7 @@ void Driver::eulerStdDevRosDecoder(an_packet_t* an_packet) {
 	msg_cv_.notify_one();
 }
 
+
 /**
  * @brief Function to decode the NED Velocity ANPP Packet (ANPP.35).
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
@@ -2251,6 +2241,33 @@ void Driver::nedVelocityRosDecoder(an_packet_t* an_packet) {
 		ned_velocity_msg_.velocity.north = ned_velocity_packet.velocity[0];
 		ned_velocity_msg_.velocity.east = ned_velocity_packet.velocity[1];
 		ned_velocity_msg_.velocity.down = ned_velocity_packet.velocity[2];
+	}
+	msg_write_done_ = true;
+	msg_cv_.notify_one();
+}
+
+/**
+ * @brief Function to decode the body Velocity ANPP Packet (ANPP.36).
+ * @param an_packet a pointer to an an_packet_t object which will be decoded.
+ */
+void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
+	body_velocity_packet_t body_velocity_packet;
+	std::unique_lock<std::mutex> lock(messages_mutex_);
+
+	if (decode_body_velocity_packet(&body_velocity_packet, an_packet) == 0) {
+		body_velocity_msg_.header.stamp = this->get_clock()->now();
+		body_velocity_msg_.header.frame_id = frame_id_;
+		body_velocity_msg_.anpp_header.header_lrc = an_packet->header[0];
+		body_velocity_msg_.anpp_header.id = an_packet->id;
+		body_velocity_msg_.anpp_header.length = an_packet->length;
+		body_velocity_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
+
+		// Native NED nav frame - intentionally not rotated here. The Option A bridge package
+		// rotates this together with velocity_std_dev's covariance in a single operation, using
+		// the current orientation, so the mean and covariance can never end up inconsistent.
+		body_velocity_msg_.velocity.x = body_velocity_packet.velocity[0];
+		body_velocity_msg_.velocity.y = body_velocity_packet.velocity[1];
+		body_velocity_msg_.velocity.z = body_velocity_packet.velocity[2];
 	}
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
