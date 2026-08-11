@@ -55,12 +55,12 @@ adnav_node:
       23, 4,    # Status (system_status/filter_status)
       24, 4,    # Position Standard Deviation
       25, 4,    # Velocity Standard Deviation
-      26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance
+      27, 4,    # Quart Orientation Standard Deviation -> imu.orientation_covariance
       28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
-      33, 4,    # ECEF Position -> pose
-      35, 4,    # NED Velocity
+      34, 4,    # UTM Position -> pose
+      36, 4,    # Body Velocity
       38, 4,    # Body Acceleration -> imu.linear_acceleration (FRD->FLU fixed)
-      39, 4,    # Euler Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
+      40, 4,    # Quart Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
       42, 4,    # Angular Velocity -> imu.angular_velocity (FRD->FLU fixed)
       43, 4,    # Angular Acceleration (diagnostic only)
     ]
