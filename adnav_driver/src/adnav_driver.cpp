@@ -79,6 +79,11 @@ Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
 
 	// Create Publishers for the node
 	createPublishers();
+	// No ANPP packet currently provides angular-rate or linear-acceleration standard deviations.
+	// ROS Imu uses a -1 diagonal entry to indicate that a covariance is unavailable; leaving the
+	// default zero array would incorrectly claim perfect certainty to robot_localization.
+	imu_msg_.angular_velocity_covariance.fill(-1.0);
+	imu_msg_.linear_acceleration_covariance.fill(-1.0);
 
 	// Send current setup of timer period, and packet periods to the device.
 	deviceSetup();
@@ -218,6 +223,7 @@ void Driver::createPublishers() {
 	// ADV-153 Phase 3: lightweight per-packet raw topics (packets 24/25/26/35/38/39/40/42/43)
 	position_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::PositionStdDev>(std::string(node_name_ + "/position_std_dev"), 10);
 	velocity_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::VelocityStdDev>(std::string(node_name_ + "/velocity_std_dev"), 10);
+	ned_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::NedVelocity>(std::string(node_name_ + "/ned_velocity"), 10);
 	quaternion_std_dev_pub_ = this->create_publisher<adnav_interfaces::msg::QuaternionStdDev>(std::string(node_name_ + "/quaternion_std_dev"), 10);
 	body_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::BodyVelocity>(std::string(node_name_ + "/body_velocity"), 10);
 	body_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::BodyAcceleration>(std::string(node_name_ + "/body_acceleration"), 10);
@@ -677,6 +683,7 @@ void Driver::publishTimerCallback() {
 	// ADV-153 Phase 3: lightweight per-packet raw topics
 	position_std_dev_pub_->publish(position_std_dev_msg_);
 	velocity_std_dev_pub_->publish(velocity_std_dev_msg_);
+	ned_velocity_pub_->publish(ned_velocity_msg_);
 	quaternion_std_dev_pub_->publish(quaternion_std_dev_msg_);
 	body_velocity_pub_->publish(body_velocity_msg_);
 	body_acceleration_pub_->publish(body_acceleration_msg_);
@@ -1668,6 +1675,9 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
 				break;
 
+			case packet_id_euler_orientation_standard_deviation: eulerStdDevRosDecoder(an_packet);
+				break;
+
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
@@ -1679,6 +1689,9 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 				break;
 
 			case packet_id_velocity_standard_deviation: velocityStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_ned_velocity: nedVelocityRosDecoder(an_packet);
 				break;
 
 			case packet_id_body_velocity: bodyVelocityRosDecoder(an_packet);
@@ -1898,10 +1911,8 @@ void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
 
 	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
 	 {
-		// IMU message
-		imu_msg_.orientation_covariance[0] = quaternion_orientation_standard_deviation_packet.standard_deviation[0];
-		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
-		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
+		// Packet 27 quaternion uncertainty is intentionally not mapped into imu_msg_.orientation_covariance.
+		// Packet 26 is the authoritative roll/pitch/heading covariance source for this integration.
 	}
 	// Now that work is complete notify an update for the publisher.
 	msg_write_done_ = true;
@@ -2235,9 +2246,8 @@ void Driver::nedVelocityRosDecoder(an_packet_t* an_packet) {
 		ned_velocity_msg_.anpp_header.length = an_packet->length;
 		ned_velocity_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
 
-		// Native NED nav frame - intentionally not rotated here. The Option A bridge package
-		// rotates this together with velocity_std_dev's covariance in a single operation, using
-		// the current orientation, so the mean and covariance can never end up inconsistent.
+			// Packet 35 is the NED velocity mean. It has no matching covariance packet and is
+		// not consumed by the odometry bridge; packet 35 plus packet 25 form the bridge input.
 		ned_velocity_msg_.velocity.north = ned_velocity_packet.velocity[0];
 		ned_velocity_msg_.velocity.east = ned_velocity_packet.velocity[1];
 		ned_velocity_msg_.velocity.down = ned_velocity_packet.velocity[2];

@@ -46,19 +46,18 @@ adnav_node:
     # Packet 20, kept at a much lower rate (period=40 -> 5Hz) purely as a UTC timestamp source for
     # imu_msg_/nav_fix_msg_ headers and a NavSatFix/legacy-twist diagnostic feed - none of its
     # position/velocity/orientation/status fields are used for the odom pipeline anymore (see the
-    # design doc S2 frame audit + S7 Phase 3). Packets 34 (UTM) and 36 (body velocity) are
-    # deliberately NOT requested (ECEF/33 + NED velocity/35 chosen instead, see S3). Packet 40
-    # (quaternion orientation) is diagnostic-only/not yet frame-corrected - add [40, 4] here if you
-    # want to bench-validate it, but it's not required by the locked-in pipeline.
+    # design doc S2 frame audit + S7 Phase 3). Position for the bridge comes from packet 20's
+    # latitude/longitude/height NavSatFix; packet 25 supplies NED velocity standard deviations and
+    # packet 35 supplies the matching NED velocity mean. Packets 34 (UTM) and 36 (body velocity)
+    # are not required by the locked-in pipeline.
     packet_request: [
       20, 40,   # System State (low-rate: UTC timestamp + legacy NavSatFix/twist only)
       23, 4,    # Status (system_status/filter_status)
       24, 4,    # Position Standard Deviation
       25, 4,    # Velocity Standard Deviation
-      27, 4,    # Quart Orientation Standard Deviation -> imu.orientation_covariance
+      26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance/euler_std_dev
       28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
-      34, 4,    # UTM Position -> pose
-      36, 4,    # Body Velocity
+      35, 4,    # NED Velocity -> atlas_ins_odom_bridge
       38, 4,    # Body Acceleration -> imu.linear_acceleration (FRD->FLU fixed)
       40, 4,    # Quart Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
       42, 4,    # Angular Velocity -> imu.angular_velocity (FRD->FLU fixed)
