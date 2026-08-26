@@ -188,18 +188,13 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     sensor_msgs::msg::NavSatFix     nav_fix_msg_;
     sensor_msgs::msg::FluidPressure baro_msg_;
     sensor_msgs::msg::Temperature   temp_msg_;
-    // ADV-153 Phase 3: DEPRECATED - raw NED linear + raw FRD angular, no frame conversion, no
-    // frame documented on the message itself (confirmed broken in the S0 spike). The new pipeline
-    // does not consume this: position/velocity come from pose/ned_velocity, angular rate from the
-    // now frame-correct imu.angular_velocity. Kept only for backwards compatibility with any
-    // existing external subscriber; do not use for anything frame-sensitive. See the design doc
-    // S7 Phase 3 notes.
+    // ADV-153: Packet-20 linear and angular velocity source for the bridge's /ins/twist topic.
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
     diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
     diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
 
-    // ADV-153 Phase 3: lightweight per-packet raw messages (packets 24/25/26/35/38/39/40/42/43)
+    // ADV-153 Phase 3: lightweight per-packet raw messages.
     adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
     adnav_interfaces::msg::VelocityStdDev          velocity_std_dev_msg_;
     adnav_interfaces::msg::QuaternionStdDev         quaternion_std_dev_msg_;
@@ -219,7 +214,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr 			magnetic_field_pub_;
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr 			barometric_pressure_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
-    // ADV-153 Phase 3: DEPRECATED, see twist_msg_ above - not fixed, not consumed by the new pipeline.
+    // ADV-153: consumed by atlas_ins_odom_bridge for /ins/twist.
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
     rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
