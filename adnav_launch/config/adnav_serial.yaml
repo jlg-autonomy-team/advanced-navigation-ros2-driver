@@ -43,24 +43,18 @@ adnav_node:
     # e.g. Requesting Packet 20 with a period of 50 is [20,50]
     # ADV-153 Phase 3: full packet set for the odom pipeline, all at period=4 (50Hz with
     # packet_timer_period=5000 below, i.e. 1,000,000/(4*5000), matching publish_us's 50Hz) except
-    # Packet 20, kept at a much lower rate (period=40 -> 5Hz) purely as a UTC timestamp source for
-    # imu_msg_/nav_fix_msg_ headers and a NavSatFix/legacy-twist diagnostic feed - none of its
-    # position/velocity/orientation/status fields are used for the odom pipeline anymore (see the
-    # design doc S2 frame audit + S7 Phase 3). Position for the bridge comes from packet 20's
-    # latitude/longitude/height NavSatFix; packet 25 supplies NED velocity standard deviations and
-    # packet 35 supplies the matching NED velocity mean. Packets 34 (UTM) and 36 (body velocity)
-    # are not required by the locked-in pipeline.
+    # Packet 20 supplies the NavSatFix and twist inputs used by the bridge, and timestamps the
+    # driver IMU message. Packet 25 supplies velocity standard deviations for /ins/twist. Packets
+    # 34/35/36/38 (UTM/NED velocity/body velocity/body acceleration) are not requested.
     packet_request: [
-      20, 40,   # System State (low-rate: UTC timestamp + legacy NavSatFix/twist only)
+      20, 4,    # System State (NavSatFix/twist source and IMU timestamp)
       23, 4,    # Status (system_status/filter_status)
       24, 4,    # Position Standard Deviation
       25, 4,    # Velocity Standard Deviation
       26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance/euler_std_dev
       28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
-      35, 4,    # NED Velocity -> atlas_ins_odom_bridge
-      38, 4,    # Body Acceleration -> imu.linear_acceleration (FRD->FLU fixed)
-      40, 4,    # Quart Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
-      42, 4,    # Angular Velocity -> imu.angular_velocity (FRD->FLU fixed)
+      39, 4,    # Euler Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
+      42, 4,    # Angular Velocity -> imu.angular_velocity (twist angular velocity source)
       43, 4,    # Angular Acceleration (diagnostic only)
     ]
     

@@ -214,7 +214,7 @@ void Driver::createPublishers() {
 	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>(std::string(node_name_ + "/magnetic_field"), 10);
 	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>(std::string(node_name_ + "/barometric_pressure"), 10);
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(std::string(node_name_ + "/temperature"), 10);
-	// ADV-153 Phase 3: DEPRECATED topic - see twist_msg_ in adnav_driver.h for why.
+	// ADV-153: Packet-20 twist source consumed by atlas_ins_odom_bridge.
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
 	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
@@ -1830,8 +1830,7 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			if(ntrip_client_.get() != nullptr) {
 				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
 			}
-			// TWIST (DEPRECATED - see twist_msg_ in adnav_driver.h; raw NED/FRD passthrough, no
-			// frame conversion, not consumed by the new pipeline. Left as-is for compatibility.)
+			// Packet-20 velocity source consumed by atlas_ins_odom_bridge for /ins/twist.
 			twist_msg_.linear.x = system_state_packet.velocity[0];
 			twist_msg_.linear.y = system_state_packet.velocity[1];
 			twist_msg_.linear.z = system_state_packet.velocity[2];
@@ -1840,13 +1839,9 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
 
 
-			// ADV-153 Phase 3: imu_msg_.orientation/angular_velocity/linear_acceleration (and
-			// pose_msg_.orientation) are no longer sourced from Packet 20 here - they now come
-			// from the lightweight Packets 39 (EulerOrientation)/42 (AngularVelocity)/38
-			// (BodyAcceleration) respectively, in eulerOrientationRosDecoder()/angularVelRosDecoder()/
-			// bodyAccelRosDecoder() below, which also apply the FRD->FLU fix. imu_msg_.header.stamp
-			// still comes from here since Packet 20 remains the only packet with a UTC timestamp
-			// requested (kept at low rate for diagnostics/nav_sat_fix per the design doc).
+			// ADV-153: imu_msg_.orientation and imu_msg_.angular_velocity come from packets 39 and
+			// 42. Linear acceleration is sourced from packet 28 through imu_raw_msg_.
+			// imu_msg_.header.stamp still comes from packet 20.
 			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
 			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
 			imu_msg_.header.frame_id = frame_id_;
@@ -2246,8 +2241,7 @@ void Driver::nedVelocityRosDecoder(an_packet_t* an_packet) {
 		ned_velocity_msg_.anpp_header.length = an_packet->length;
 		ned_velocity_msg_.anpp_header.crc = an_packet->header[3] | (an_packet->header[4] << 8);
 
-			// Packet 35 is the NED velocity mean. It has no matching covariance packet and is
-		// not consumed by the odometry bridge; packet 35 plus packet 25 form the bridge input.
+			// Packet 35 is retained as a raw diagnostic topic for external consumers.
 		ned_velocity_msg_.velocity.north = ned_velocity_packet.velocity[0];
 		ned_velocity_msg_.velocity.east = ned_velocity_packet.velocity[1];
 		ned_velocity_msg_.velocity.down = ned_velocity_packet.velocity[2];
@@ -2286,8 +2280,8 @@ void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
 /**
  * @brief Function to decode the Body Acceleration ANPP Packet (ANPP.38).
  *
- * Also feeds imu_msg_.linear_acceleration with the FRD->FLU fix applied (confirmed bug, S0 spike):
- * static 180deg rotation about X, (x, -y, -z).
+ * Publishes the decoded body acceleration on the diagnostic topic. The estimated IMU's linear
+ * acceleration is sourced only from packet 28 through imu_raw_msg_.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
@@ -2308,11 +2302,6 @@ void Driver::bodyAccelRosDecoder(an_packet_t* an_packet) {
 		body_acceleration_msg_.body_acceleration.y = body_acceleration_packet.acceleration[1];
 		body_acceleration_msg_.body_acceleration.z = body_acceleration_packet.acceleration[2];
 		body_acceleration_msg_.g_force = body_acceleration_packet.g_force;
-
-		// imu_msg_: FRD->FLU fix applied.
-		imu_msg_.linear_acceleration.x = body_acceleration_packet.acceleration[0];
-		imu_msg_.linear_acceleration.y = -body_acceleration_packet.acceleration[1];
-		imu_msg_.linear_acceleration.z = -body_acceleration_packet.acceleration[2];
 	}
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
@@ -2397,7 +2386,8 @@ void Driver::quaternionOrientRosDecoder(an_packet_t* an_packet) {
 /**
  * @brief Function to decode the Angular Velocity ANPP Packet (ANPP.42).
  *
- * Also feeds imu_msg_.angular_velocity with the FRD->FLU fix applied: (x, -y, -z).
+ * Publishes the decoded angular velocity and feeds imu_msg_.angular_velocity with the
+ * FRD->FLU fix applied: (x, -y, -z).
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
