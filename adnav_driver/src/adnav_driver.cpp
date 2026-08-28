@@ -1517,7 +1517,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @brief Function to send the packet Timer to the device and await the acknowledgement.
  *
  * @param packet_timer_period Period for the packet rates in microseconds.
- * @param UTC_sync Synchronize with UTC time. True by default.
+ * @param utc_sync Synchronize with UTC time. True by default.
  * @param permanent Is this a permanent change. True by default.
  * @return acknowledgement Message
  */
@@ -2446,7 +2446,6 @@ void Driver::angularAccelRosDecoder(an_packet_t* an_packet) {
 }
 
 }// namespace adnav
-
 
 
 
