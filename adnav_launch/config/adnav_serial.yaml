@@ -45,7 +45,8 @@ adnav_node:
     # packet_timer_period=5000 below, i.e. 1,000,000/(4*5000), matching publish_us's 50Hz) except
     # Packet 20 supplies the NavSatFix and twist inputs used by the bridge, and timestamps the
     # driver IMU message. Packet 25 supplies velocity standard deviations for /ins/twist. Packets
-    # 34/35/36/38 (UTM/NED velocity/body velocity/body acceleration) are not requested.
+    # 34/35/36/38 (UTM/NED velocity/body velocity/body acceleration) are not requested: the bridge
+    # deliberately keeps Packet 20 plus Packet 25 together and rotates both with one matrix.
     packet_request: [
       20, 4,    # System State (NavSatFix/twist source and IMU timestamp)
       23, 4,    # Status (system_status/filter_status)
@@ -53,7 +54,7 @@ adnav_node:
       25, 4,    # Velocity Standard Deviation
       26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance/euler_std_dev
       28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
-      39, 4,    # Euler Orientation -> imu.orientation (FRD->FLU / REP103 fixed)
+      39, 4,    # Euler Orientation -> imu.orientation (ROS ENU yaw remap)
       42, 4,    # Angular Velocity -> imu.angular_velocity (twist angular velocity source)
       43, 4,    # Angular Acceleration (diagnostic only)
     ]
