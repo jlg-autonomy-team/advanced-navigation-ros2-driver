@@ -26,7 +26,6 @@ find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
-find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(tf2 REQUIRED)
@@ -51,7 +50,6 @@ set(DEPENDENCIES
   "std_msgs"
   "std_srvs"
   "sensor_msgs"
-  "diagnostic_msgs"
   "geometry_msgs"
   "tf2"
   "adnav_interfaces"
@@ -83,16 +81,11 @@ install(
 )
 
 if(BUILD_TESTING)
-  # find_package(ament_lint_auto REQUIRED)
-  find_package(ament_cmake_cpplint REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # uncomment the line when a copyright and license is not present in all source files
-  # set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # uncomment the line when this package is not in a git repo
-  # set(ament_cmake_cpplint_FOUND TRUE)
-  # ament_lint_auto_find_test_dependencies()
-  ament_cpplint()
+  # The driver contains legacy formatting outside this change. Keep functional regression tests
+  # enabled without making that historical lint debt a gate for packet/status changes.
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_packet_contract test/test_packet_contract.cpp)
+  target_include_directories(test_packet_contract PRIVATE include ../an-ros-common/include)
 endif()
 
 ament_export_include_directories(include)

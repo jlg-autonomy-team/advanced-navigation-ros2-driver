@@ -43,36 +43,53 @@
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
 
-#include <rs232.h>
-#include <an_packet_protocol.h>
-#include <ins_packets.h>
-#include <adnav_utils.h>
+#include "packet_contract.hpp"
 #include <adnav_comms.h>
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
+#include <adnav_utils.h>
+#include <an_packet_protocol.h>
+#include <ins_packets.h>
+#include <rs232.h>
 
 // Adnav_interfaces
+#include <adnav_interfaces/msg/filter_status.hpp>
+#include <adnav_interfaces/msg/llh.hpp>
+#include <adnav_interfaces/msg/status_packet.hpp>
+#include <adnav_interfaces/msg/system_status.hpp>
+#include <adnav_interfaces/srv/installation_alignment.hpp>
+#include <adnav_interfaces/srv/ntrip.hpp>
 #include <adnav_interfaces/srv/packet_periods.hpp>
 #include <adnav_interfaces/srv/packet_timer_period.hpp>
 #include <adnav_interfaces/srv/request_packets.hpp>
-#include <adnav_interfaces/srv/ntrip.hpp>
-#include <adnav_interfaces/msg/llh.hpp>
+// ADV-153: Phase 3 message definitions for lightweight per-packet raw topics
+#include <adnav_interfaces/msg/position_std_dev.hpp>
+#include <adnav_interfaces/msg/velocity_std_dev.hpp>
+#include <adnav_interfaces/msg/quaternion_std_dev.hpp>
+#include <adnav_interfaces/msg/euler_std_dev.hpp>
+#include <adnav_interfaces/msg/body_velocity.hpp>
+#include <adnav_interfaces/msg/ned_velocity.hpp>
+#include <adnav_interfaces/msg/body_acceleration.hpp>
+#include <adnav_interfaces/msg/quaternion_orientation.hpp>
+#include <adnav_interfaces/msg/euler_orientation.hpp>
+#include <adnav_interfaces/msg/angular_velocity.hpp>
+#include <adnav_interfaces/msg/angular_acceleration.hpp>
 
 // ROS2 Packages, Services, Messages
-#include <rclcpp/rclcpp.hpp>
-#include <tf2/LinearMath/Quaternion.h>
-#include <rcl_interfaces/msg/set_parameters_result.hpp>
-#include <std_msgs/msg/string.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
-#include <sensor_msgs/msg/time_reference.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/pose.hpp>
-#include <diagnostic_msgs/msg/diagnostic_array.hpp>
-#include <sensor_msgs/msg/magnetic_field.hpp>
-#include <sensor_msgs/msg/temperature.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/temperature.hpp>
+#include <sensor_msgs/msg/time_reference.hpp>
+#include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <tf2/LinearMath/Quaternion.h>
 
 #if defined(WIN32) || defined(_WIN32)
     #pragma comment(lib, "ws2_32.lib")  // Winsock Library
@@ -101,8 +118,10 @@ constexpr const int    DEFAULT_BAUD_RATE = 115200;
 constexpr const int    DEFAULT_TIMER_PERIOD = 20000;
 constexpr const int    DEFAULT_PACKET_TIMER_PERIOD = 10000;
 constexpr const char * DEFAULT_COM_PORT = "ttyUSB0";
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10";
+constexpr const int DEFAULT_PACKET_REQUEST[16] = {
+    20, 10, 23, 10, 24, 10, 25, 10, 26, 10, 28, 10, 39, 10, 42, 10};
+constexpr const char *DEFAULT_PACKET_REQUEST_STR =
+    "20, 10, 23, 10, 24, 10, 25, 10, 26, 10, 28, 10, 39, 10, 42, 10";
 constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
 constexpr const bool   DEFAULT_NTRIP_STATE = false;
 constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
@@ -110,6 +129,12 @@ constexpr const int    DEFAULT_TIMEOUT = 5;
 constexpr const int    MAX_TIMER_PERIOD = 65535;
 constexpr const int    MIN_TIMER_PERIOD = 1000;
 constexpr const int    MIN_PACKET_PERIOD = 1;
+// ADV-153: waitForDevicePacket() previously busy-spun forever (near 100% CPU) if the device
+// never responded (e.g. wrong baud rate, bad cable, unplugged device) - confirmed on real
+// hardware. These bound that wait with a clear failure instead of an infinite loop.
+constexpr const int    DEVICE_HANDSHAKE_TIMEOUT_SEC = 10;
+constexpr const int    DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS = 500;
+constexpr const int    DEVICE_HANDSHAKE_POLL_SLEEP_MS = 10;
 constexpr const int    MAX_PACKET_PERIOD = 65535;
 constexpr const int    MIN_PORT = 0;
 constexpr const int    MAX_PORT = 65535;
@@ -169,10 +194,26 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     sensor_msgs::msg::NavSatFix     nav_fix_msg_;
     sensor_msgs::msg::FluidPressure baro_msg_;
     sensor_msgs::msg::Temperature   temp_msg_;
+    // ADV-153: Packet-20 linear and angular velocity source for the bridge's /ins/twist topic.
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
-    diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
-    diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
+    adnav_interfaces::msg::SystemStatus system_status_msg_;
+    adnav_interfaces::msg::FilterStatus filter_status_msg_;
+    adnav_interfaces::msg::StatusPacket status_packet_msg_;
+
+    // ADV-153 Phase 3: lightweight per-packet raw messages.
+    adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
+    adnav_interfaces::msg::VelocityStdDev          velocity_std_dev_msg_;
+    adnav_interfaces::msg::QuaternionStdDev         quaternion_std_dev_msg_;
+    adnav_interfaces::msg::EulerStdDev              euler_std_dev_msg_;
+    adnav_interfaces::msg::BodyVelocity             body_velocity_msg_;
+    adnav_interfaces::msg::BodyAcceleration        body_acceleration_msg_;
+    adnav_interfaces::msg::QuaternionOrientation    quaternion_orientation_msg_;
+    adnav_interfaces::msg::EulerOrientation         euler_orientation_msg_;
+    adnav_interfaces::msg::AngularVelocity         angular_velocity_msg_;
+    adnav_interfaces::msg::NedVelocity             ned_velocity_msg_;
+    adnav_interfaces::msg::AngularAcceleration     angular_acceleration_msg_;
+    bool have_ecef_position_ = false;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             		imu_pub_;
@@ -181,10 +222,30 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<sensor_msgs::msg::MagneticField>::SharedPtr 			magnetic_field_pub_;
     rclcpp::Publisher<sensor_msgs::msg::FluidPressure>::SharedPtr 			barometric_pressure_pub_;
     rclcpp::Publisher<sensor_msgs::msg::Temperature>::SharedPtr 			temperature_pub_;
+    // ADV-153: consumed by atlas_ins_odom_bridge for /ins/twist.
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
-    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
-    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::SystemStatus>::SharedPtr
+        system_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::FilterStatus>::SharedPtr
+        filter_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::StatusPacket>::SharedPtr
+        status_pub_;
+
+    // ADV-153 Phase 3: lightweight per-packet raw topic publishers
+    rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::QuaternionStdDev>::SharedPtr      quaternion_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerStdDev>::SharedPtr
+        euler_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::BodyVelocity>::SharedPtr          body_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr
+        euler_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
 
     // ~~~~~~~~~~~~~~~ Callback handles and parameters
     // Callback groups Allows the callbacks to be processed on a different thread by
@@ -215,11 +276,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Service<std_srvs::srv::Empty>::SharedPtr restart_read_srv_;
     rclcpp::Service<adnav_interfaces::srv::RequestPackets>::SharedPtr request_packet_srv_;
     rclcpp::Service<adnav_interfaces::srv::Ntrip>::SharedPtr ntrip_srv_;
+    rclcpp::Service<adnav_interfaces::srv::InstallationAlignment>::SharedPtr installation_alignment_srv_;
 
     // Threading variables
     std::mutex messages_mutex_;
-    std::condition_variable msg_cv_;
-    bool msg_write_done_;
+    uint32_t pending_updates_ = 0;
+    bool have_euler_orientation_ = false;
 
     std::mutex acknowledge_mutex_;
     std::condition_variable srv_cv_;
@@ -240,6 +302,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void createPublishers();
     void createServices();
     void deviceSetup();
+    void pumpAndLogAcknowledge(const std::string& label);
     void setupParamService();
     void setupParams();
 
@@ -251,8 +314,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     //~~~~~~ Logging Functions
     void openLogFile();
-    void statusErrLog(const std::string& errmsg);
-    void statusWarnLog(const std::string& warnmsg);
+    rclcpp::Time receiptTime();
+    rclcpp::Time packet20Time(const system_state_packet_t &packet,
+                              const rclcpp::Time &receipt);
+    void stampHeader(std_msgs::msg::Header &header, const rclcpp::Time &stamp);
+    void markUpdate(uint32_t update);
 
     //~~~~~~ ROS Services
     void srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Request> request,
@@ -263,6 +329,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
         std::shared_ptr<adnav_interfaces::srv::RequestPackets::Response> response);
     void srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Request> request,
         std::shared_ptr<adnav_interfaces::srv::Ntrip::Response> response);
+    void srvInstallationAlignment(
+        const std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Request> request,
+        std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Response> response);
 
     //~~~~~~ Parameter Functions
     rcl_interfaces::msg::SetParametersResult ParamSetCallback(const std::vector<rclcpp::Parameter>& Params);
@@ -290,15 +359,31 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     adnav_interfaces::msg::RawAcknowledge SendPacketTimer(int packet_timer_period, bool utc_sync = true , bool permanent = true);
     adnav_interfaces::msg::RawAcknowledge SendPacketPeriods(const std::vector<adnav_interfaces::msg::PacketPeriod>& periods,
         bool clear_existing = true, bool permanent = true);
+    // ADV-153: sends an Installation Alignment Packet (ANPP 185) built from a roll/pitch offset
+    // only (yaw offset always 0 - see InstallationAlignment.srv for the full rationale).
+    adnav_interfaces::msg::RawAcknowledge SendInstallationAlignment(double roll, double pitch, bool permanent = true);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
     void acknowledgeDecoder(an_packet_t* an_packet);
     void deviceInfoDecoder(an_packet_t* an_packet);
     void systemStateRosDecoder(an_packet_t* an_packet);
-    void ecefPosRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
+
+    // ADV-153 Phase 3: decoders for packets 23/24/25/26/27/35/38/39/40/42/43
+    void statusRosDecoder(an_packet_t* an_packet);
+    void positionStdDevRosDecoder(an_packet_t* an_packet);
+    void velocityStdDevRosDecoder(an_packet_t* an_packet);
+    void bodyVelocityRosDecoder(an_packet_t* an_packet);
+    void bodyAccelRosDecoder(an_packet_t* an_packet);
+    void quaternionOrientRosDecoder(an_packet_t* an_packet);
+    void angularVelRosDecoder(an_packet_t* an_packet);
+    void angularAccelRosDecoder(an_packet_t* an_packet);
+    void eulerStdDevRosDecoder(an_packet_t* an_packet);
+    void eulerOrientationRosDecoder(an_packet_t* an_packet);
+    void ecefPosRosDecoder(an_packet_t* an_packet);
+    void nedVelocityRosDecoder(an_packet_t* an_packet);
 };
 
 }  // namespace adnav

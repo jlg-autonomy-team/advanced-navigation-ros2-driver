@@ -34,10 +34,25 @@ int main(int argc, char * argv[])
 	rclcpp::init(argc, argv);
 
 	// create an multithreaded executor
-	rclcpp::executors::MultiThreadedExecutor executor;
+	// ADV-153: explicit small thread count instead of the rclcpp default of
+	// std::thread::hardware_concurrency(), which over-provisions massively on many-core
+	// machines (28 threads observed on a 28-core bench host) for a node with only
+	// reading_group_/publishing_group_/service_group_ (3 callback groups) worth of real
+	// concurrency needs.
+	rclcpp::executors::MultiThreadedExecutor executor(rclcpp::ExecutorOptions(), 3);
 
 	// Create a shared pointer to the driver node.
-	std::shared_ptr<rclcpp::Node> node = std::make_shared<adnav::Driver>();
+	// ADV-153: the constructor performs the device handshake (waitForDevicePacket()), which now
+	// throws std::runtime_error on a bounded timeout instead of spinning forever - catch that here
+	// so a disconnected/misconfigured device produces a clean, loud failure instead of a hang.
+	std::shared_ptr<rclcpp::Node> node;
+	try {
+		node = std::make_shared<adnav::Driver>();
+	} catch (const std::exception & e) {
+		RCLCPP_FATAL(rclcpp::get_logger("adnav_driver"), "Failed to start driver: %s", e.what());
+		rclcpp::shutdown();
+		return 1;
+	}
 
 	// Add the driver node to the executor and spin it.
 	executor.add_node(node);

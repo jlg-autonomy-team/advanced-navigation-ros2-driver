@@ -28,62 +28,102 @@
 
 #include "adnav_driver.h"
 
+#include <limits>
+
 namespace adnav {
+
+namespace {
+
+void setAnppHeader(adnav_interfaces::msg::ANPPHeader &header,
+                   const an_packet_t *packet) {
+  header.header_lrc = packet->header[0];
+  header.id = packet->id;
+  header.length = packet->length;
+  header.crc = packet->header[3] | (packet->header[4] << 8);
+}
+
+bool standardDeviationToVariance(double standard_deviation, double &variance) {
+  if (!std::isfinite(standard_deviation) || standard_deviation < 0.0 ||
+      standard_deviation > std::sqrt(std::numeric_limits<double>::max())) {
+    return false;
+  }
+  variance = standard_deviation * standard_deviation;
+  return std::isfinite(variance);
+}
+
+} // namespace
 /**
  * @brief Constructor for the Advanced Navigation Driver node
  *
- * This will create a Driver instance. Declare node parameters, setup threading groups and callbacks.
- * Initialize the log file, and open the communications to the device.
+ * This will create a Driver instance. Declare node parameters, setup threading
+ * groups and callbacks. Initialize the log file, and open the communications to
+ * the device.
  */
-Driver::Driver(): rclcpp::Node("adnav_driver"), msg_write_done_(false)
-{
-	// Set default values
-	memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
+Driver::Driver() : rclcpp::Node("adnav_driver") {
+  // Set default values
+  memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
 
-	// ~~~~~~~~~~ Create the callback groups
-	// Callback group only for reading ANPP Packets
-	reading_group_ 		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  // ~~~~~~~~~~ Create the callback groups
+  // Callback group only for reading ANPP Packets
+  reading_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-	// Multithreaded group for publishing ROS messages
-	publishing_group_	= this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+  // Multithreaded group for publishing ROS messages
+  publishing_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
 
-	// Group for completing incoming services.
-	service_group_		= this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  // Group for completing incoming services.
+  service_group_ =
+      this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
-	// Setup parameters for the node
-	setupParamService();
+  // Setup parameters for the node
+  setupParamService();
 
-	// Get the name of the node
-	node_name_ = this->get_name();
-	RCLCPP_INFO(this->get_logger(), "\nNamespace: %s\n", node_name_.c_str());
+  // Get the name of the node
+  node_name_ = this->get_name();
+  RCLCPP_INFO(this->get_logger(), "\nNamespace: %s\n", node_name_.c_str());
 
-	// Create timers for callbacks
-	publish_timer_ = this->create_wall_timer(
-      	publish_timer_interval_ , std::bind(&Driver::publishTimerCallback, this), publishing_group_);
+  // Create timers for callbacks
+  publish_timer_ = this->create_wall_timer(
+      publish_timer_interval_, std::bind(&Driver::publishTimerCallback, this),
+      publishing_group_);
 
-	read_timer_ = this->create_wall_timer(
-		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
+  read_timer_ = this->create_wall_timer(
+      read_timer_interval_, std::bind(&Driver::recievePackets, this),
+      reading_group_);
 
-	// Setup Services for the node
-	createServices();
+  // Setup Services for the node
+  createServices();
 
-	// Open a new ANPP Log file for data logging
-	anpp_logger_.openFile("Log_", ".anpp", log_path_);
+  // Open a new ANPP Log file for data logging
+  anpp_logger_.openFile("Log_", ".anpp", log_path_);
 
-	// Open Communications with the device
-	communicator_ = std::make_unique<adnav::Communicator>(comms_data_);
-	communicator_->open();
+  // Open Communications with the device
+  communicator_ = std::make_unique<adnav::Communicator>(comms_data_);
+  communicator_->open();
 
-	// Request device info with Packet 1 and 3
-	waitForDevicePacket();
+  // Request device info with Packet 1 and 3
+  waitForDevicePacket();
 
-	// Create Publishers for the node
-	createPublishers();
+  // Create Publishers for the node
+  createPublishers();
+  // No ANPP packet currently provides angular-rate or linear-acceleration
+  // standard deviations. ROS Imu uses a -1 diagonal entry to indicate that a
+  // covariance is unavailable; leaving the default zero array would incorrectly
+  // claim perfect certainty to robot_localization.
+  imu_msg_.angular_velocity_covariance.fill(-1.0);
+  imu_msg_.linear_acceleration_covariance.fill(-1.0);
+  imu_msg_.orientation_covariance.fill(-1.0);
+  imu_raw_msg_.angular_velocity_covariance.fill(-1.0);
+  imu_raw_msg_.linear_acceleration_covariance.fill(-1.0);
+  imu_raw_msg_.orientation_covariance.fill(-1.0);
 
-	// Send current setup of timer period, and packet periods to the device.
-	deviceSetup();
+  // Send current setup of timer period, and packet periods to the device.
+  deviceSetup();
 
-	RCLCPP_INFO(this->get_logger(), "Your Advanced Navigation ROS driver is currently running\nPress Ctrl-C to interrupt\n");
+  RCLCPP_INFO(this->get_logger(),
+              "Your Advanced Navigation ROS driver is currently running\nPress "
+              "Ctrl-C to interrupt\n");
 }
 
 /**
@@ -109,6 +149,13 @@ Driver::~Driver() {
 
 /**
  * @brief Function to ask for device information from a Advanced navigation device and wait for its response.
+ *
+ * ADV-153: bounded with a timeout + backoff instead of spinning forever. Confirmed on real
+ * hardware that a baud-rate/cabling mismatch left this looping at ~100% CPU indefinitely with
+ * no diagnostic, since the device never responds. Now: (1) sleeps briefly when no bytes are
+ * available instead of tight-looping the read() call, (2) only re-sends the request packet
+ * periodically instead of every single iteration, (3) throws after DEVICE_HANDSHAKE_TIMEOUT_SEC
+ * with a clear error so the caller (the constructor) fails fast and loud instead of hanging.
  */
 void Driver::waitForDevicePacket() {
 	// initialize the decoder.
@@ -120,9 +167,34 @@ void Driver::waitForDevicePacket() {
 
 	RCLCPP_DEBUG(this->get_logger(), "Requesting Device Info");
 
+	const auto handshake_start = std::chrono::steady_clock::now();
+	// ADV-153: initialise to "now - interval" (not time_point::min()) so the very first loop
+	// iteration's `now - last_request_time >= interval` check is guaranteed to be true and
+	// actually fire the first request. Using time_point::min() here overflowed the duration
+	// subtraction (undefined behaviour) and silently made the check false forever, so
+	// requestDeviceInfo() was never called - confirmed on hardware: a manual, correctly-framed
+	// ANPP request via a raw serial connection got an immediate response, but this loop's own
+	// request was never actually sent.
+	auto last_request_time = handshake_start - std::chrono::milliseconds(DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS);
+
 	while(recieved == false && rclcpp::ok()) {
-		// Request the device to send the Device info packet.
-		requestDeviceInfo();
+		const auto now = std::chrono::steady_clock::now();
+
+		if (now - handshake_start >= std::chrono::seconds(DEVICE_HANDSHAKE_TIMEOUT_SEC)) {
+			RCLCPP_ERROR(this->get_logger(),
+				"Timed out after %d seconds waiting for a Device Information Packet (ANPP.3) response. "
+				"Check that the device is powered, the cable/port (%s) is correct, and that baud_rate "
+				"(%d) matches the device's actual configured baud rate.",
+				DEVICE_HANDSHAKE_TIMEOUT_SEC, comms_data_.com_port.c_str(), comms_data_.baud_rate);
+			throw std::runtime_error("Timed out waiting for device handshake (Device Information Packet)");
+		}
+
+		// Only re-send the request packet periodically rather than every loop iteration -
+		// the device only needs to see it once per interval, not hundreds of times per second.
+		if (now - last_request_time >= std::chrono::milliseconds(DEVICE_HANDSHAKE_REQUEST_INTERVAL_MS)) {
+			requestDeviceInfo();
+			last_request_time = now;
+		}
 
 		// Read in some data from the connection.
 		bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
@@ -149,6 +221,9 @@ void Driver::waitForDevicePacket() {
 				// Ensure that you free the an_packet when your done with it or you will leak memory
 				an_packet_free(&an_packet);
 			}
+		} else {
+			// No data available yet - avoid busy-spinning the CPU while waiting.
+			std::this_thread::sleep_for(std::chrono::milliseconds(DEVICE_HANDSHAKE_POLL_SLEEP_MS));
 		}
 	}
 }
@@ -174,10 +249,54 @@ void Driver::createPublishers() {
 	magnetic_field_pub_ = this->create_publisher<sensor_msgs::msg::MagneticField>(std::string(node_name_ + "/magnetic_field"), 10);
 	barometric_pressure_pub_ = this->create_publisher<sensor_msgs::msg::FluidPressure>(std::string(node_name_ + "/barometric_pressure"), 10);
 	temperature_pub_ = this->create_publisher<sensor_msgs::msg::Temperature>(std::string(node_name_ + "/temperature"), 10);
+	// ADV-153: Packet-20 twist source consumed by atlas_ins_odom_bridge.
 	twist_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(std::string(node_name_ + "/twist"), 10);
 	pose_pub_ = this->create_publisher<geometry_msgs::msg::Pose>(std::string(node_name_ + "/pose"), 10);
-	system_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/system_status"), 10);
-	filter_status_pub_ = this->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(std::string(node_name_ + "/filter_status"), 10);
+        system_status_pub_ =
+            this->create_publisher<adnav_interfaces::msg::SystemStatus>(
+                std::string(node_name_ + "/system_status"), 10);
+        filter_status_pub_ =
+            this->create_publisher<adnav_interfaces::msg::FilterStatus>(
+                std::string(node_name_ + "/filter_status"), 10);
+        status_pub_ =
+            this->create_publisher<adnav_interfaces::msg::StatusPacket>(
+                std::string(node_name_ + "/status"), 10);
+
+        // ADV-153 Phase 3: lightweight per-packet raw topics (packets
+        // 24/25/26/35/38/39/40/42/43)
+        position_std_dev_pub_ =
+            this->create_publisher<adnav_interfaces::msg::PositionStdDev>(
+                std::string(node_name_ + "/position_std_dev"), 10);
+        velocity_std_dev_pub_ =
+            this->create_publisher<adnav_interfaces::msg::VelocityStdDev>(
+                std::string(node_name_ + "/velocity_std_dev"), 10);
+        ned_velocity_pub_ =
+            this->create_publisher<adnav_interfaces::msg::NedVelocity>(
+                std::string(node_name_ + "/ned_velocity"), 10);
+        quaternion_std_dev_pub_ =
+            this->create_publisher<adnav_interfaces::msg::QuaternionStdDev>(
+                std::string(node_name_ + "/quaternion_std_dev"), 10);
+        euler_std_dev_pub_ =
+            this->create_publisher<adnav_interfaces::msg::EulerStdDev>(
+                std::string(node_name_ + "/euler_std_dev"), 10);
+        body_velocity_pub_ =
+            this->create_publisher<adnav_interfaces::msg::BodyVelocity>(
+                std::string(node_name_ + "/body_velocity"), 10);
+        body_acceleration_pub_ =
+            this->create_publisher<adnav_interfaces::msg::BodyAcceleration>(
+                std::string(node_name_ + "/body_acceleration"), 10);
+        quaternion_orientation_pub_ = this->create_publisher<
+            adnav_interfaces::msg::QuaternionOrientation>(
+            std::string(node_name_ + "/quaternion_orientation"), 10);
+        euler_orientation_pub_ =
+            this->create_publisher<adnav_interfaces::msg::EulerOrientation>(
+                std::string(node_name_ + "/euler_orientation"), 10);
+        angular_velocity_pub_ =
+            this->create_publisher<adnav_interfaces::msg::AngularVelocity>(
+                std::string(node_name_ + "/angular_velocity"), 10);
+        angular_acceleration_pub_ =
+            this->create_publisher<adnav_interfaces::msg::AngularAcceleration>(
+                std::string(node_name_ + "/angular_acceleration"), 10);
 }
 
 /**
@@ -223,7 +342,18 @@ void Driver::createServices() {
 			std::placeholders::_2),
 		rmw_qos_profile_services_default,
 		service_group_);
+
+	installation_alignment_srv_ = this->create_service<adnav_interfaces::srv::InstallationAlignment>(
+		(node_name_ + "/installation_alignment"),
+		std::bind(
+			&Driver::srvInstallationAlignment,
+			this,
+			std::placeholders::_1,
+			std::placeholders::_2),
+		rmw_qos_profile_services_default,
+		service_group_);
 }
+
 
 /**
  * @brief Method to push requested configuration to the device.
@@ -237,6 +367,14 @@ void Driver::deviceSetup() {
 	// Create and send a Packet Timer Period Packet.
 	acknowledge_recieve_ = true; // Since we are not waiting for device acknowledgement at startup
 	(void)SendPacketTimer(packet_timer_period_); // Will overwrite acknowledge_receive_ to false
+	// ADV-153: SendPacketTimer()'s built-in AcknowledgeHandler() wait is a no-op this early in the
+	// constructor - nothing decodes incoming bytes until the executor starts spinning
+	// read_timer_'s callback, well after this function returns - so it always instantly returned
+	// stale/meaningless data. Confirmed on real hardware: this bench unit's
+	// packet_timer_period=1000 was silently REJECTED (Acknowledge result=3/failure_range) for
+	// most of a session before anyone noticed, purely because nothing ever checked. Manually pump
+	// a short, bounded read/decode loop here instead to actually catch and log the real result.
+	pumpAndLogAcknowledge("Packet Timer Period");
 
 	// Create and fill a periods format.
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
@@ -250,6 +388,54 @@ void Driver::deviceSetup() {
 	// Since we are not waiting for device acknowledgement at startup
 	acknowledge_recieve_ = true;
 	(void)SendPacketPeriods(packet_periods); // Will overwrite acknowledge_receive_ to false.
+	pumpAndLogAcknowledge("Packet Periods");
+}
+
+/**
+ * @brief Manually pump a short, bounded read/decode loop to catch and log the real Acknowledge
+ * Packet result for a config packet just sent from deviceSetup().
+ *
+ * Needed only for the deviceSetup() call site: it runs synchronously in the constructor, before
+ * the executor (and therefore read_timer_'s callback) starts spinning, so there is nothing else
+ * pumping communicator_->read()/decodePackets() to receive the device's response during that
+ * window. Reuses decodePackets() (which dispatches Acknowledge Packets to acknowledgeDecoder())
+ * so the check-and-log logic here doesn't have to duplicate any ANPP parsing.
+ *
+ * @param label human-readable name of the config just sent, for the log message.
+ */
+void Driver::pumpAndLogAcknowledge(const std::string& label) {
+	an_decoder_t an_decoder;
+	an_decoder_initialise(&an_decoder);
+	acknowledge_recieve_ = false;
+
+	const auto start = std::chrono::steady_clock::now();
+	while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500)) {
+		int bytes_received = communicator_->read(an_decoder_pointer(&an_decoder), an_decoder_size(&an_decoder));
+		if (bytes_received > 0) {
+			decodePackets(an_decoder, bytes_received);
+			if (acknowledge_recieve_) {
+				break;
+			}
+		} else {
+			std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		}
+	}
+
+	if (!acknowledge_recieve_) {
+		RCLCPP_WARN(this->get_logger(), "%s: no Acknowledge Packet received within 500ms of sending.",
+			label.c_str());
+		return;
+	}
+	if (acknowledge_packet_.acknowledge_result == acknowledge_success) {
+		RCLCPP_INFO(this->get_logger(), "%s: accepted by device.", label.c_str());
+	} else {
+		RCLCPP_ERROR(this->get_logger(),
+			"%s: REJECTED by device (Acknowledge result=%d - see acknowledge_result_e in "
+			"ins_packets.h, e.g. 3=failure_range means a requested value is out of range for this "
+			"specific unit even if within the generic ANPP-documented bounds). The device is still "
+			"running its previous, last-successfully-accepted configuration.",
+			label.c_str(), acknowledge_packet_.acknowledge_result);
+	}
 }
 
 /**
@@ -520,6 +706,50 @@ void Driver::recievePackets() {
 	decodePackets(an_decoder, bytes_received);
 }
 
+rclcpp::Time Driver::receiptTime() {
+  const auto now = this->get_clock()->now();
+  if (now.nanoseconds() == 0) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "ROS time is zero; configure /clock when use_sim_time is enabled. "
+        "Decoded packet timestamps cannot be nonzero until ROS time advances.");
+  }
+  return now;
+}
+
+rclcpp::Time Driver::packet20Time(const system_state_packet_t &packet,
+                                  const rclcpp::Time &receipt) {
+  const int64_t timestamp = packet20StampNanoseconds(
+      packet.unix_time_seconds, packet.microseconds,
+      packet.filter_status.b.utc_time_initialised, receipt.nanoseconds());
+  if (timestamp != receipt.nanoseconds()) {
+    return rclcpp::Time(timestamp, this->get_clock()->get_clock_type());
+  }
+  return receipt;
+}
+
+void Driver::stampHeader(std_msgs::msg::Header &header,
+                         const rclcpp::Time &stamp) {
+  rclcpp::Time effective = stamp;
+  if (effective.nanoseconds() == 0) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Decoded packet has a zero ROS timestamp; waiting for "
+                         "ROS time to advance.");
+  }
+  const rclcpp::Time previous(header.stamp,
+                              this->get_clock()->get_clock_type());
+  const int64_t monotonic_timestamp = monotonicStampNanoseconds(
+      effective.nanoseconds(), previous.nanoseconds());
+  if (monotonic_timestamp != effective.nanoseconds()) {
+    effective =
+        rclcpp::Time(monotonic_timestamp, this->get_clock()->get_clock_type());
+  }
+  header.stamp = effective;
+  header.frame_id = frame_id_;
+}
+
+void Driver::markUpdate(uint32_t update) { pending_updates_ |= update; }
+
 /**
  * @brief Periodic callback for publishing ROS messages.
  *
@@ -527,44 +757,70 @@ void Driver::recievePackets() {
  * Awaits a signal from a ROS Decoder method before publishing and accessing shared data.
  */
 void Driver::publishTimerCallback() {
-	// Since the messages can be filled in other threads ensure exclusive access.
 	std::unique_lock<std::mutex> lock(messages_mutex_);
+        const uint32_t updates = pending_updates_;
+        pending_updates_ = 0;
 
-	// Debug timekeeper value
-	rcl_time_point_value_t time = 0, diff = 0;
+        if (updates & kPacket20Update) {
+          nav_sat_fix_pub_->publish(nav_fix_msg_);
+          twist_pub_->publish(twist_msg_);
+        }
+        if (updates & kPacket23Update) {
+          system_status_pub_->publish(system_status_msg_);
+          filter_status_pub_->publish(filter_status_msg_);
+          status_pub_->publish(status_packet_msg_);
+        }
+        if (updates & kPacket24Update) {
+          position_std_dev_pub_->publish(position_std_dev_msg_);
+        }
+        if (updates & kPacket25Update) {
+          velocity_std_dev_pub_->publish(velocity_std_dev_msg_);
+        }
+        if (updates & kPacket26Update) {
+          euler_std_dev_pub_->publish(euler_std_dev_msg_);
+        }
+        if (updates & kPacket27Update) {
+          quaternion_std_dev_pub_->publish(quaternion_std_dev_msg_);
+        }
+        if (updates & kPacket28Update) {
+          imu_raw_pub_->publish(imu_raw_msg_);
+          magnetic_field_pub_->publish(mag_field_msg_);
+          barometric_pressure_pub_->publish(baro_msg_);
+          temperature_pub_->publish(temp_msg_);
+        }
+        if (updates & kPacket33Update) {
+          if (have_ecef_position_) {
+            pose_pub_->publish(pose_msg_);
+          }
+        }
+        if (updates & kPacket35Update) {
+          ned_velocity_pub_->publish(ned_velocity_msg_);
+        }
+        if (updates & kPacket36Update) {
+          body_velocity_pub_->publish(body_velocity_msg_);
+        }
+        if (updates & kPacket38Update) {
+          body_acceleration_pub_->publish(body_acceleration_msg_);
+        }
+        if (updates & kPacket39Update) {
+          euler_orientation_pub_->publish(euler_orientation_msg_);
+          imu_pub_->publish(imu_msg_);
+        }
+        if (updates & kPacket40Update) {
+          quaternion_orientation_pub_->publish(quaternion_orientation_msg_);
+        }
+        if (updates & kPacket42Update) {
+          angular_velocity_pub_->publish(angular_velocity_msg_);
+          if (have_euler_orientation_) {
+            imu_pub_->publish(imu_msg_);
+          }
+        }
+        if (updates & kPacket43Update) {
+          angular_acceleration_pub_->publish(angular_acceleration_msg_);
+        }
 
-	// Check for updates from other threads.
-	if(!msg_write_done_) {
-		time = this->get_clock().get()->now().nanoseconds();
-		// Only wait until timeout. otherwise log error and exit callback.
-		if (msg_cv_.wait_for(lock, std::chrono::milliseconds(DEFAULT_TIMEOUT)) == std::cv_status::timeout) {
-			RCLCPP_DEBUG(this->get_logger(), "Publish Timeout");
-			if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-			RCLCPP_DEBUG(this->get_logger(), "PubTimeout:\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
-			return;
-		}
-	}
-
-	// Debug message to show how long it waited to be awoken.
-	if(time) diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: L\tAccess: %d\tTimeWait: %ld μs", pub_num_, diff/1000);
-
-	// PUBLISH MESSAGES
-	nav_sat_fix_pub_->publish(nav_fix_msg_);
-	twist_pub_->publish(twist_msg_);
-	imu_pub_->publish(imu_msg_);
-	imu_raw_pub_->publish(imu_raw_msg_);
-	system_status_pub_->publish(system_status_msg_);
-	filter_status_pub_->publish(filter_status_msg_);
-	magnetic_field_pub_->publish(mag_field_msg_);
-	barometric_pressure_pub_->publish(baro_msg_);
-	temperature_pub_->publish(temp_msg_);
-	pose_pub_->publish(pose_msg_);
-
-	RCLCPP_DEBUG(this->get_logger(), "Pub: \t\tMutex: U\tAccess: %d", pub_num_++);
-
-	// Restore the blocking flag before exiting the lock guard.
-	msg_write_done_ = false;
+        RCLCPP_DEBUG(this->get_logger(), "Published updates 0x%08x (cycle %d)",
+                     updates, pub_num_++);
 }
 
 /**
@@ -593,36 +849,6 @@ void Driver::RestartReader() {
 	// Reset the timer using the class stored interval.
 	read_timer_ = this->create_wall_timer(
 		read_timer_interval_, std::bind(&Driver::recievePackets, this), reading_group_);
-}
-
-//~~~~~~ Logging Functions
-
-/**
- * @brief Function to log an error message into the ROS system status and to the Error Logger
- *
- * This function assumes it is being called from a function with thread safe access to the ROS messages.
- *
- * @param errmsg string containing the message to be put into the logger.
- */
-void Driver::statusErrLog(const std::string& errmsg) {
-
-	system_status_msg_.level = 2; // ERROR state
-	system_status_msg_.message += errmsg;
-	RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 10000, errmsg.c_str());
-}
-
-/**
- * @brief Function to log an warning message into the ROS filter status and to the warning Logger
- *
- * This function assumes it is being called from a function with thread safe access to the ROS messages.
- *
- * @param warnmsg string containing the message to be put into the logger.
- */
-void Driver::statusWarnLog(const std::string& warnmsg) {
-
-	filter_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::WARN; // WARN state
-	filter_status_msg_.message += warnmsg;
-	RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 10000, warnmsg.c_str());
 }
 
 //~~~~~~ Service Functions
@@ -833,6 +1059,30 @@ void Driver::srvNtrip(const std::shared_ptr<adnav_interfaces::srv::Ntrip::Reques
 	if(ntrip_state_.en == true) response->reason = std::string("Successfuly enabled NTRIP client.");
 	else response->reason = std::string("Successfully disabled NTRIP client.");
 
+}
+
+/**
+ * @brief Service to request a new Installation Alignment (ANPP 185) be sent to the device -
+ * a fixed roll/pitch offset correcting for the sensor's physical mounting tilt (yaw offset is
+ * always sent as 0 - see InstallationAlignment.srv for the full rationale).
+ *
+ * @param request Const shared pointer to an InstallationAlignment Request msg.
+ * @param response Shared pointer to an InstallationAlignment Response.
+ */
+void Driver::srvInstallationAlignment(
+		const std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Request> request,
+		std::shared_ptr<adnav_interfaces::srv::InstallationAlignment::Response> response) {
+
+	RCLCPP_INFO(this->get_logger(),
+		"Installation Alignment Service Called:\n\tRoll: %f\n\tPitch: %f\n\tPermanent: %d",
+		request->roll, request->pitch, request->permanent);
+
+	response->acknowledgement = SendInstallationAlignment(request->roll, request->pitch, request->permanent);
+
+	char buf[15];
+	snprintf(buf, sizeof(buf)/sizeof(buf[0]), "%s%d%s", "Failure: ", response->acknowledgement.result, "\n");
+	RCLCPP_INFO(this->get_logger(), "Received Update acknowledgement:\nID: %d\tCRC: %d\nOutcome: %s", response->acknowledgement.id,
+            response->acknowledgement.crc, (response->acknowledgement.result == 0) ? "Success\n":buf);
 }
 
 //~~~~~~ Parameter Functions
@@ -1100,19 +1350,26 @@ rcl_interfaces::msg::SetParametersResult Driver::validatePacketRequest(const rcl
 			element >= end_configuration_packets) { // above range
 				result.successful = false;
 				ss << "\n[Error] ID: " << element << "\t isn't a valid packet.\n";
-			}
-		}else { // If odd (Period)
-			if(element < MIN_PACKET_PERIOD || element > MAX_PACKET_PERIOD) {
-				result.successful = false;
-				ss << "\n[Error] Period: " << element << "\t isn't a valid period.\n";
-			}
-		}
-	}
+                        } else if (!isRosDriverPacketId(element)) {
+                          result.successful = false;
+                          ss << "\n[Error] ID: " << element
+                             << " isn't supported by the ROS driver's packet "
+                                "definitions.\n";
+                        }
+                } else { // If odd (Period)
+                  if (element < MIN_PACKET_PERIOD ||
+                      element > MAX_PACKET_PERIOD) {
+                    result.successful = false;
+                    ss << "\n[Error] Period: " << element
+                       << "\t isn't a valid period.\n";
+                  }
+                }
+        }
 
-	if(!result.successful)	 {
-		result.reason = ss.str();
-	}
-	return result;
+        if (!result.successful) {
+          result.reason = ss.str();
+        }
+        return result;
 }
 
 /**
@@ -1363,7 +1620,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::AcknowledgeHandler() {
  * @brief Function to send the packet Timer to the device and await the acknowledgement.
  *
  * @param packet_timer_period Period for the packet rates in microseconds.
- * @param UTC_sync Synchronize with UTC time. True by default.
+ * @param utc_sync Synchronize with UTC time. True by default.
  * @param permanent Is this a permanent change. True by default.
  * @return acknowledgement Message
  */
@@ -1437,6 +1694,54 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendPacketPeriods(const std::vecto
 	return AcknowledgeHandler();
 }
 
+/**
+ * @brief Function to send an Installation Alignment Packet (ANPP 185) to the device and await
+ * the acknowledgement.
+ *
+ * ADV-153: only ever sets a roll/pitch offset (yaw offset always 0) - see
+ * an-ros-common/srv/InstallationAlignment.srv for the full rationale. The alignment DCM is built
+ * from roll/pitch only, using the standard aerospace R = Rz(0) * Ry(pitch) * Rx(roll) convention.
+ * GNSS antenna/odometer/external-data offsets are not currently configurable through this
+ * service and are sent as all-zero (matches the device's own un-configured default).
+ *
+ * @param roll Roll offset in radians (rotation about the vehicle's forward/X axis).
+ * @param pitch Pitch offset in radians (rotation about the vehicle's left/Y axis).
+ * @param permanent Boolean value for overwriting configuration memory. Default = True.
+ * @return acknowledgement Message
+ */
+adnav_interfaces::msg::RawAcknowledge Driver::SendInstallationAlignment(double roll, double pitch, bool permanent) {
+	RCLCPP_INFO(this->get_logger(),
+		"Sending Installation Alignment Request to device (roll=%f, pitch=%f, permanent=%d).",
+		roll, pitch, permanent);
+
+	installation_alignment_packet_t installation_alignment_packet;
+	an_packet_t *an_packet;
+
+	memset(&installation_alignment_packet, 0, sizeof(installation_alignment_packet));
+	installation_alignment_packet.permanent = permanent;
+
+	const float cr = static_cast<float>(cos(roll));
+	const float sr = static_cast<float>(sin(roll));
+	const float cp = static_cast<float>(cos(pitch));
+	const float sp = static_cast<float>(sin(pitch));
+
+	// R = Rz(0) * Ry(pitch) * Rx(roll)
+	installation_alignment_packet.alignment_dcm[0][0] = cp;
+	installation_alignment_packet.alignment_dcm[0][1] = sp * sr;
+	installation_alignment_packet.alignment_dcm[0][2] = sp * cr;
+	installation_alignment_packet.alignment_dcm[1][0] = 0.0f;
+	installation_alignment_packet.alignment_dcm[1][1] = cr;
+	installation_alignment_packet.alignment_dcm[1][2] = -sr;
+	installation_alignment_packet.alignment_dcm[2][0] = -sp;
+	installation_alignment_packet.alignment_dcm[2][1] = cp * sr;
+	installation_alignment_packet.alignment_dcm[2][2] = cp * cr;
+
+	an_packet = encode_installation_alignment_packet(&installation_alignment_packet);
+	encodeAndSend(an_packet);
+
+	return AcknowledgeHandler();
+}
+
 //~~~~~~ Decoders
 
 /**
@@ -1470,22 +1775,77 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_system_state: systemStateRosDecoder(an_packet);
 				break;
 
-			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
+			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
 				break;
 
-			case packet_id_quaternion_orientation_standard_deviation: quartOrientSDRosDriver(an_packet);
+			case packet_id_euler_orientation_standard_deviation: eulerStdDevRosDecoder(an_packet);
 				break;
 
 			case packet_id_raw_sensors: rawSensorsRosDecoder(an_packet);
 				break;
 
-			default:
-				RCLCPP_WARN/*_THROTTLE*/(this->get_logger(), /* *this->get_clock(), 500, */
-					"Unsupported packet definition for ROS driver. PACKET_ID: %d", an_packet->id);
+			// ADV-153 Phase 3: lightweight per-packet raw topics
+			case packet_id_status: statusRosDecoder(an_packet);
 				break;
-			}
-			// Ensure that you free the an_packet when your done with it or you will leak memory
-			an_packet_free(&an_packet);
+
+			case packet_id_position_standard_deviation: positionStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_velocity_standard_deviation: velocityStdDevRosDecoder(an_packet);
+				break;
+
+			case packet_id_ned_velocity: nedVelocityRosDecoder(an_packet);
+				break;
+
+                        case packet_id_ecef_position:
+                          ecefPosRosDecoder(an_packet);
+                          break;
+
+                        case packet_id_body_velocity:
+                          bodyVelocityRosDecoder(an_packet);
+                          break;
+
+                        case packet_id_body_acceleration:
+                          bodyAccelRosDecoder(an_packet);
+                          break;
+
+                        // Packet 39 is the live Euler orientation source used
+                        // by the bridge.  Keep this dispatch explicit: omitting
+                        // it falls through to the unsupported-packet warning.
+                        case packet_id_euler_orientation:
+                          eulerOrientationRosDecoder(an_packet);
+                          break;
+
+                        case packet_id_quaternion_orientation:
+                          quaternionOrientRosDecoder(an_packet);
+                          break;
+
+                        case packet_id_angular_velocity:
+                          angularVelRosDecoder(an_packet);
+                          break;
+
+                        case packet_id_angular_acceleration:
+                          angularAccelRosDecoder(an_packet);
+                          break;
+
+                        default:
+                          if (isRosDriverPacketId(an_packet->id)) {
+                            RCLCPP_ERROR(
+                                this->get_logger(),
+                                "ROS driver packet definition is missing a "
+                                "decoder case for PACKET_ID: %d",
+                                an_packet->id);
+                            break;
+                          }
+                          RCLCPP_DEBUG(this->get_logger(),
+                                       "Ignoring packet not handled by the ROS "
+                                       "driver. PACKET_ID: %d",
+                                       an_packet->id);
+                          break;
+                        }
+                        // Ensure that you free the an_packet when your done
+                        // with it or you will leak memory
+                        an_packet_free(&an_packet);
 		} // while an_packet != NULL
 	}// if bytes > 0
 }
@@ -1548,378 +1908,424 @@ void Driver::deviceInfoDecoder(an_packet_t* an_packet) {
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
 void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
+  const auto receipt = receiptTime();
+  system_state_packet_t packet;
+  if (decode_system_state_packet(&packet, an_packet) != 0) {
+    return;
+  }
 
-	system_state_packet_t system_state_packet;
-	std::stringstream ss;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: L\tAccess: %d", P20_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  const auto stamp = packet20Time(packet, receipt);
+  stampHeader(nav_fix_msg_.header, stamp);
+  switch (packet.filter_status.b.gnss_fix_type) {
+  case gnss_fix_2d:
+  case gnss_fix_3d:
+    nav_fix_msg_.status.status = sensor_msgs::msg::NavSatStatus::STATUS_FIX;
+    break;
+  case gnss_fix_sbas:
+  case gnss_fix_omnistar:
+    nav_fix_msg_.status.status =
+        sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
+    break;
+  case gnss_fix_differential:
+  case gnss_fix_rtk_float:
+  case gnss_fix_rtk_fixed:
+    nav_fix_msg_.status.status =
+        sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
+    break;
+  default:
+    nav_fix_msg_.status.status = sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
+    break;
+  }
+  nav_fix_msg_.latitude = packet.latitude * RADIANS_TO_DEGREES;
+  nav_fix_msg_.longitude = packet.longitude * RADIANS_TO_DEGREES;
+  nav_fix_msg_.altitude = packet.height;
 
-	if(decode_system_state_packet(&system_state_packet, an_packet) == 0)
-	 {
-			// NAVSATFIX
-			nav_fix_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			nav_fix_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
-			nav_fix_msg_.header.frame_id = frame_id_;
-			if ((system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_2d) ||
-				(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_3d))
-			 {
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_FIX;
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_FIX;
-			}
-			else if ((system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_sbas) ||
-					(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_omnistar))
-			 {
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_SBAS_FIX;
-			}
-			else if ((system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_differential) ||
-					(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_rtk_float) ||
-					(system_state_packet.filter_status.b.gnss_fix_type == gnss_fix_rtk_fixed))
-			 {
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_GBAS_FIX;
-			}
-			else
-			 {
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
-				nav_fix_msg_.status.status= sensor_msgs::msg::NavSatStatus::STATUS_NO_FIX;
-			}
-			nav_fix_msg_.latitude = system_state_packet.latitude * RADIANS_TO_DEGREES;
-			nav_fix_msg_.longitude = system_state_packet.longitude * RADIANS_TO_DEGREES;
-			nav_fix_msg_.altitude = system_state_packet.height;
-			nav_fix_msg_.position_covariance = { pow(system_state_packet.standard_deviation[1], 2), 0.0, 0.0,
-				0.0, pow(system_state_packet.standard_deviation[0], 2), 0.0,
-				0.0, 0.0, pow(system_state_packet.standard_deviation[2], 2)};
-			nav_fix_msg_.position_covariance_type = nav_fix_msg_.COVARIANCE_TYPE_DIAGONAL_KNOWN;
+  double east_variance = 0.0;
+  double north_variance = 0.0;
+  double up_variance = 0.0;
+  if (standardDeviationToVariance(packet.standard_deviation[1],
+                                  east_variance) &&
+      standardDeviationToVariance(packet.standard_deviation[0],
+                                  north_variance) &&
+      standardDeviationToVariance(packet.standard_deviation[2], up_variance)) {
+    nav_fix_msg_.position_covariance = {east_variance,  0.0, 0.0, 0.0,
+                                        north_variance, 0.0, 0.0, 0.0,
+                                        up_variance};
+    nav_fix_msg_.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+  } else {
+    nav_fix_msg_.position_covariance.fill(0.0);
+    nav_fix_msg_.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+  }
 
-			llh_.latitude = system_state_packet.latitude * RADIANS_TO_DEGREES;
-			llh_.longitude = system_state_packet.longitude * RADIANS_TO_DEGREES;
-			llh_.height = system_state_packet.height;
+  llh_.latitude = nav_fix_msg_.latitude;
+  llh_.longitude = nav_fix_msg_.longitude;
+  llh_.height = nav_fix_msg_.altitude;
+  if (ntrip_client_ != nullptr) {
+    ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
+  }
 
-			if(ntrip_client_.get() != nullptr) {
-				ntrip_client_->set_location(llh_.latitude, llh_.longitude, llh_.height);
-			}
-			// TWIST
-			twist_msg_.linear.x = system_state_packet.velocity[0];
-			twist_msg_.linear.y = system_state_packet.velocity[1];
-			twist_msg_.linear.z = system_state_packet.velocity[2];
-			twist_msg_.angular.x = system_state_packet.angular_velocity[0];
-			twist_msg_.angular.y = system_state_packet.angular_velocity[1];
-			twist_msg_.angular.z = system_state_packet.angular_velocity[2];
-
-
-			// IMU
-			imu_msg_.header.stamp.sec = system_state_packet.unix_time_seconds;
-			imu_msg_.header.stamp.nanosec = system_state_packet.microseconds*1000;
-			imu_msg_.header.frame_id = frame_id_;
-			// Using the RPY orientation as done by cosama
-			orientation_.setRPY(
-				system_state_packet.orientation[0],
-				system_state_packet.orientation[1],
-				M_PI/2.0f - system_state_packet.orientation[2] // REP 103
-			);
-			imu_msg_.orientation.x = orientation_[0];
-			imu_msg_.orientation.y = orientation_[1];
-			imu_msg_.orientation.z = orientation_[2];
-			imu_msg_.orientation.w = orientation_[3];
-
-			// POSE Orientation
-			pose_msg_.orientation.x = orientation_[0];
-			pose_msg_.orientation.y = orientation_[1];
-			pose_msg_.orientation.z = orientation_[2];
-			pose_msg_.orientation.w = orientation_[3];
-
-			imu_msg_.angular_velocity.x = system_state_packet.angular_velocity[0]; // These the same as the TWIST msg values
-			imu_msg_.angular_velocity.y = system_state_packet.angular_velocity[1];
-			imu_msg_.angular_velocity.z = system_state_packet.angular_velocity[2];
-
-			// The IMU linear acceleration is now coming from the RAW Sensors Accelerometer
-			imu_msg_.linear_acceleration.x = system_state_packet.body_acceleration[0];
-			imu_msg_.linear_acceleration.y = system_state_packet.body_acceleration[1];
-			imu_msg_.linear_acceleration.z = system_state_packet.body_acceleration[2];
-
-			// SYSTEM STATUS
-			system_status_msg_.message = "";
-			system_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK; // default OK state
-			std::stringstream serial_num;
-			serial_num << std::hex << device_information_packet_.serial_number[0] <<
-				device_information_packet_.serial_number[1] << device_information_packet_.serial_number[2];
-			system_status_msg_.hardware_id = serial_num.str();
-			if (system_state_packet.system_status.b.system_failure) {
-				ss << "\n0. SYSTEM FAILURE DETECTED.";
-			}
-			if (system_state_packet.system_status.b.accelerometer_sensor_failure) {
-				ss << "\n1. ACCELEROMETER SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.gyroscope_sensor_failure) {
-				ss << "\n2. GYROSCOPE SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.magnetometer_sensor_failure) {
-				ss << "\n3. MAGNETOMETER SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.pressure_sensor_failure) {
-				ss << "\n4. PRESSURE SENSOR FAILURE.";
-			}
-			if (system_state_packet.system_status.b.gnss_failure) {
-				ss << "\n5. GNSS FAILURE.";
-			}
-			if (system_state_packet.system_status.b.accelerometer_over_range) {
-				ss << "\n6. ACCELEROMETER OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.gyroscope_over_range) {
-				ss << "\n7. GYROSCOPE OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.magnetometer_over_range) {
-				ss << "\n8. MAGNETOMETER OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.pressure_over_range) {
-				ss << "\n9. PRESSURE OVER RANGE.";
-			}
-			if (system_state_packet.system_status.b.minimum_temperature_alarm) {
-				ss << "\n10. MINIMUM TEMPERATURE ALARM.";
-			}
-			if (system_state_packet.system_status.b.maximum_temperature_alarm) {
-				ss << "\n11. MAXIMUM TEMPERATURE ALARM.";
-			}
-			if (system_state_packet.system_status.b.internal_data_logging_error) {
-				ss << "\n12. INTERNAL DATA LOGGING ERROR.";
-			}
-			if (system_state_packet.system_status.b.high_voltage_alarm) {
-				ss << "\n13. HIGH VOLTAGE ALARM.";
-			}
-			if (system_state_packet.system_status.b.gnss_antenna_fault) {
-				ss << "\n14. GNSS ANTENNA FAULT.";
-			}
-			if (system_state_packet.system_status.b.serial_port_overflow_alarm) {
-				ss << "\n15. SERIAL PORT DATA OVERFLOW.";
-			}
-
-			// If an error occured log it
-			if(!ss.str().empty()) {
-				ss << std::endl;
-				statusErrLog(ss.str());
-				// empty the stringstream
-				ss.str("");
-			}
-
-			// FILTER STATUS
-			filter_status_msg_.message = "";
-			filter_status_msg_.level = diagnostic_msgs::msg::DiagnosticStatus::OK;; // default OK state
-			filter_status_msg_.hardware_id = serial_num.str();
-			if (system_state_packet.filter_status.b.orientation_filter_initialised) {
-				filter_status_msg_.message += "\n0. Orientation Filter Initialised.";
-			}
-			else {
-				 ss << "\n0. Orientation Filter NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.ins_filter_initialised) {
-				filter_status_msg_.message += "\n1. Navigation Filter Initialised.";
-			}
-			else {
-				 ss << "\n1. Navigation Filter NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.heading_initialised) {
-				filter_status_msg_.message += "\n2. Heading Initialised.";
-			}
-			else {
-				 ss << "\n2. Heading NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.utc_time_initialised) {
-				filter_status_msg_.message += "\n3. UTC Time Initialised.";
-			}
-			else {
-				 ss << "\n3. UTC Time NOT Initialised.";
-			}
-			if (system_state_packet.filter_status.b.event1_flag) {
-				 ss << "\n7. Event 1 Occured.";
-			}
-			else {
-				filter_status_msg_.message += "\n7. Event 1 NOT Occured.";
-			}
-			if (system_state_packet.filter_status.b.event2_flag) {
-				 ss << "\n8. Event 2 Occured.";
-			}
-			else {
-				filter_status_msg_.message += "\n8. Event 2 NOT Occured.";
-			}
-			if (system_state_packet.filter_status.b.internal_gnss_enabled) {
-				filter_status_msg_.message += "\n9. Internal GNSS Enabled.";
-			}
-			else {
-				ss << "\n9. Internal GNSS NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.dual_antenna_heading_active) {
-				filter_status_msg_.message += "\n10. Dual Antenna Heading Active.";
-			}
-			else {
-				ss << "\n10. Dual Antenna Heading NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.velocity_heading_enabled) {
-				filter_status_msg_.message += "\n11. Velocity Heading Enabled.";
-			}
-			else {
-				ss << "\n11. Velocity Heading NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.atmospheric_altitude_enabled) {
-				filter_status_msg_.message += "\n12. Atmospheric Altitude Enabled.";
-			}
-			else {
-				ss << "\n12. Atmospheric Altitude NOT Enabled.";
-			}
-			if (system_state_packet.filter_status.b.external_position_active) {
-				filter_status_msg_.message += "\n13. External Position Active.";
-			}
-			else {
-				ss << "\n13. External Position NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.external_velocity_active) {
-				filter_status_msg_.message += "\n14. External Velocity Active.";
-			}
-			else {
-				ss << "\n14. External Velocity NOT Active.";
-			}
-			if (system_state_packet.filter_status.b.external_heading_active) {
-				filter_status_msg_.message += "\n15. External Heading Active.";
-			}
-			else {
-				ss << "\n16. External Heading NOT Active.";
-			}
-
-			// If a warning has occued log it
-			if(!ss.str().empty()) {
-				ss << std::endl;
-				statusWarnLog(ss.str());
-				ss.str("");
-			}
-	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 20:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P20_num_++, diff/1000);
+  twist_msg_.linear.x = packet.velocity[0];
+  twist_msg_.linear.y = packet.velocity[1];
+  twist_msg_.linear.z = packet.velocity[2];
+  twist_msg_.angular.x = packet.angular_velocity[0];
+  twist_msg_.angular.y = packet.angular_velocity[1];
+  twist_msg_.angular.z = packet.angular_velocity[2];
+  markUpdate(kPacket20Update);
 }
 
-/**
- * @brief Function to decode the ECEF Position ANPP Packet (ANPP.33).
- *
- * This function accesses in a thread safe manner the class stored ROS messages, placed relevant information into them,
- * then using the publishing control variable, requests a publisher thread to publish the message.
- *
- * @param an_packet a pointer to an an_packet_t object which will be decoded.
- */
 void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
-	ecef_position_packet_t ecef_position_packet;
-
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: L\tAccess: %d", P33_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
-
-	// ECEF Position (in meters) Packet for Pose Message
-	if(decode_ecef_position_packet(&ecef_position_packet, an_packet) == 0)
-	 {
-		pose_msg_.position.x = ecef_position_packet.position[0];
-		pose_msg_.position.y = ecef_position_packet.position[1];
-		pose_msg_.position.z = ecef_position_packet.position[2];
-	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 33:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P33_num_++, diff/1000);
+  ecef_position_packet_t packet;
+  if (decode_ecef_position_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  pose_msg_.position.x = packet.position[0];
+  pose_msg_.position.y = packet.position[1];
+  pose_msg_.position.z = packet.position[2];
+  have_ecef_position_ = true;
+  markUpdate(kPacket33Update);
 }
 
-/**
- * @brief Function to decode the Quaternion Orientation Standard Deviation ANPP Packet (ANPP.27).
- *
- * This function accesses in a thread safe manner the class stored ROS messages, placed relevant information into them,
- * then using the publishing control variable, requests a publisher thread to publish the message.
- *
- * @param an_packet a pointer to an an_packet_t object which will be decoded.
- */
 void Driver::quartOrientSDRosDriver(an_packet_t* an_packet) {
-	quaternion_orientation_standard_deviation_packet_t quaternion_orientation_standard_deviation_packet;
-	std::unique_lock<std::mutex> lock(messages_mutex_);
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27: \tMutex: L\tAccess: %d", P27_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
-
-	if(decode_quaternion_orientation_standard_deviation_packet(&quaternion_orientation_standard_deviation_packet, an_packet) == 0)
-	 {
-		// IMU message
-		imu_msg_.orientation_covariance[0] = quaternion_orientation_standard_deviation_packet.standard_deviation[0];
-		imu_msg_.orientation_covariance[4] = quaternion_orientation_standard_deviation_packet.standard_deviation[1];
-		imu_msg_.orientation_covariance[8] = quaternion_orientation_standard_deviation_packet.standard_deviation[2];
-	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 27:\tMutex: U\tAccess: %d\tTimeLocked: %ld μs", P27_num_++, diff/1000);
+  quaternion_orientation_standard_deviation_packet_t packet;
+  if (decode_quaternion_orientation_standard_deviation_packet(&packet,
+                                                              an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(quaternion_std_dev_msg_.header, stamp);
+  setAnppHeader(quaternion_std_dev_msg_.anpp_header, an_packet);
+  quaternion_std_dev_msg_.standard_deviation.w = packet.standard_deviation[0];
+  quaternion_std_dev_msg_.standard_deviation.x = packet.standard_deviation[1];
+  quaternion_std_dev_msg_.standard_deviation.y = packet.standard_deviation[2];
+  quaternion_std_dev_msg_.standard_deviation.z = packet.standard_deviation[3];
+  markUpdate(kPacket27Update);
 }
 
-/**
- * @brief Function to decode the Raw Sensor ANPP Packet (ANPP.28).
- *
- * This function accesses in a thread safe manner the class stored ROS messages, placed relevant information into them,
- * then using the publishing control variable, requests a publisher thread to publish the message.
- *
- * @param an_packet a pointer to an an_packet_t object which will be decoded.
- */
 void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
-	raw_sensors_packet_t raw_sensors_packet;
+  raw_sensors_packet_t packet;
+  if (decode_raw_sensors_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
 
-	std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(mag_field_msg_.header, stamp);
+  mag_field_msg_.magnetic_field.x = packet.magnetometers[0];
+  mag_field_msg_.magnetic_field.y = packet.magnetometers[1];
+  mag_field_msg_.magnetic_field.z = packet.magnetometers[2];
 
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28: \tMutex: L\tAccess: %d", P28_num_);
-	// Debug timekeeper
-	auto time = this->get_clock().get()->now().nanoseconds();
+  stampHeader(imu_raw_msg_.header, stamp);
+  imu_raw_msg_.orientation_covariance.fill(-1.0);
+  imu_raw_msg_.angular_velocity_covariance.fill(-1.0);
+  imu_raw_msg_.linear_acceleration_covariance.fill(-1.0);
+  imu_raw_msg_.linear_acceleration.x = packet.accelerometers[0];
+  imu_raw_msg_.linear_acceleration.y = -packet.accelerometers[1];
+  imu_raw_msg_.linear_acceleration.z = -packet.accelerometers[2];
+  imu_raw_msg_.angular_velocity.x = packet.gyroscopes[0];
+  imu_raw_msg_.angular_velocity.y = -packet.gyroscopes[1];
+  imu_raw_msg_.angular_velocity.z = -packet.gyroscopes[2];
 
-	// Fill the messages
-	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
-
-		// RAW MAGNETICFIELD VALUE FROM IMU
-		mag_field_msg_.header.frame_id = frame_id_;
-		mag_field_msg_.magnetic_field.x = raw_sensors_packet.magnetometers[0];
-		mag_field_msg_.magnetic_field.y = raw_sensors_packet.magnetometers[1];
-		mag_field_msg_.magnetic_field.z = raw_sensors_packet.magnetometers[2];
-
-		imu_raw_msg_.header.frame_id = frame_id_;
-		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
-		imu_raw_msg_.linear_acceleration.x = raw_sensors_packet.accelerometers[0];
-		imu_raw_msg_.linear_acceleration.y = raw_sensors_packet.accelerometers[1];
-		imu_raw_msg_.linear_acceleration.z = raw_sensors_packet.accelerometers[2];
-		imu_raw_msg_.angular_velocity.x = raw_sensors_packet.gyroscopes[0];
-		imu_raw_msg_.angular_velocity.y = raw_sensors_packet.gyroscopes[1];
-		imu_raw_msg_.angular_velocity.z = raw_sensors_packet.gyroscopes[2];
-
-		// BAROMETRIC PRESSURE
-		baro_msg_.header.frame_id = frame_id_;
-		baro_msg_.fluid_pressure = raw_sensors_packet.pressure;
-
-		// TEMPERATURE
-		temp_msg_.header.frame_id = frame_id_;
-		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
-
-	}
-	// Now that work is complete notify an update for the publisher.
-	msg_write_done_ = true;
-	msg_cv_.notify_one();
-	// RCLCPP_DEBUG(this->get_logger(), "Raw: \tNotifying Complete\t%d", raw_num_++);
-
-	auto diff = this->get_clock().get()->now().nanoseconds() - time;
-	RCLCPP_DEBUG(this->get_logger(), "Packet 28:\tMutex: U\tAccess: %d\tTimeLock: %ld μs", P28_num_++, diff/1000);
+  stampHeader(baro_msg_.header, stamp);
+  baro_msg_.fluid_pressure = packet.pressure;
+  stampHeader(temp_msg_.header, stamp);
+  temp_msg_.temperature = packet.pressure_temperature;
+  if (have_euler_orientation_) {
+    stampHeader(imu_msg_.header, stamp);
+  }
+  markUpdate(kPacket28Update);
 }
 
+void Driver::statusRosDecoder(an_packet_t* an_packet) {
+  status_packet_t packet;
+  if (decode_status_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
 
+  stampHeader(status_packet_msg_.header, stamp);
+  setAnppHeader(status_packet_msg_.anpp_header, an_packet);
+  status_packet_msg_.system_status.system_failure =
+      packet.system_status.b.system_failure;
+  status_packet_msg_.system_status.accelerometer_sensor_failure =
+      packet.system_status.b.accelerometer_sensor_failure;
+  status_packet_msg_.system_status.gyroscope_sensor_failure =
+      packet.system_status.b.gyroscope_sensor_failure;
+  status_packet_msg_.system_status.magnetometer_sensor_failure =
+      packet.system_status.b.magnetometer_sensor_failure;
+  status_packet_msg_.system_status.pressure_sensor_failure =
+      packet.system_status.b.pressure_sensor_failure;
+  status_packet_msg_.system_status.gnss_failure =
+      packet.system_status.b.gnss_failure;
+  status_packet_msg_.system_status.accelerometer_over_range =
+      packet.system_status.b.accelerometer_over_range;
+  status_packet_msg_.system_status.gyroscope_over_range =
+      packet.system_status.b.gyroscope_over_range;
+  status_packet_msg_.system_status.magnetometer_over_range =
+      packet.system_status.b.magnetometer_over_range;
+  status_packet_msg_.system_status.pressure_over_range =
+      packet.system_status.b.pressure_over_range;
+  status_packet_msg_.system_status.minimum_temperature_alarm =
+      packet.system_status.b.minimum_temperature_alarm;
+  status_packet_msg_.system_status.maximum_temperature_alarm =
+      packet.system_status.b.maximum_temperature_alarm;
+  status_packet_msg_.system_status.internal_data_logging_error =
+      packet.system_status.b.internal_data_logging_error;
+  status_packet_msg_.system_status.high_voltage_alarm =
+      packet.system_status.b.high_voltage_alarm;
+  status_packet_msg_.system_status.gnss_antenna_fault =
+      packet.system_status.b.gnss_antenna_disconnected;
+  status_packet_msg_.system_status.serial_port_overflow_alarm =
+      packet.system_status.b.serial_port_overflow_alarm;
 
-}// namespace adnav
+  status_packet_msg_.filter_status.orientation_filter_initialised =
+      packet.filter_status.b.orientation_filter_initialised;
+  status_packet_msg_.filter_status.ins_filter_initialised =
+      packet.filter_status.b.ins_filter_initialised;
+  status_packet_msg_.filter_status.heading_initialised =
+      packet.filter_status.b.heading_initialised;
+  status_packet_msg_.filter_status.utc_time_initialised =
+      packet.filter_status.b.utc_time_initialised;
+  status_packet_msg_.filter_status.gnss_fix_status.gnss_fix_type =
+      packet.filter_status.b.gnss_fix_type;
+  status_packet_msg_.filter_status.event1_flag =
+      packet.filter_status.b.event1_flag;
+  status_packet_msg_.filter_status.event2_flag =
+      packet.filter_status.b.event2_flag;
+  status_packet_msg_.filter_status.internal_gnss_enabled =
+      packet.filter_status.b.internal_gnss_enabled;
+  status_packet_msg_.filter_status.dual_antenna_heading_active =
+      packet.filter_status.b.dual_antenna_heading_active;
+  status_packet_msg_.filter_status.velocity_heading_enabled =
+      packet.filter_status.b.velocity_heading_enabled;
+  status_packet_msg_.filter_status.atmospheric_altitude_enabled =
+      packet.filter_status.b.atmospheric_altitude_enabled;
+  status_packet_msg_.filter_status.external_position_active =
+      packet.filter_status.b.external_position_active;
+  status_packet_msg_.filter_status.external_velocity_active =
+      packet.filter_status.b.external_velocity_active;
+  status_packet_msg_.filter_status.external_heading_active =
+      packet.filter_status.b.external_heading_active;
 
+  system_status_msg_ = status_packet_msg_.system_status;
+  filter_status_msg_ = status_packet_msg_.filter_status;
+  if (status_packet_msg_.system_status.system_failure ||
+      status_packet_msg_.system_status.gnss_failure) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Packet 23 reports a system or GNSS failure.");
+  }
+  markUpdate(kPacket23Update);
+}
 
+void Driver::positionStdDevRosDecoder(an_packet_t* an_packet) {
+  position_standard_deviation_packet_t packet;
+  if (decode_position_standard_deviation_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(position_std_dev_msg_.header, stamp);
+  setAnppHeader(position_std_dev_msg_.anpp_header, an_packet);
+  position_std_dev_msg_.standard_deviation.latitude =
+      packet.standard_deviation[0];
+  position_std_dev_msg_.standard_deviation.longitude =
+      packet.standard_deviation[1];
+  position_std_dev_msg_.standard_deviation.height =
+      packet.standard_deviation[2];
+  markUpdate(kPacket24Update);
+}
 
+void Driver::velocityStdDevRosDecoder(an_packet_t* an_packet) {
+  velocity_standard_deviation_packet_t packet;
+  if (decode_velocity_standard_deviation_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(velocity_std_dev_msg_.header, stamp);
+  setAnppHeader(velocity_std_dev_msg_.anpp_header, an_packet);
+  velocity_std_dev_msg_.standard_deviation.north = packet.standard_deviation[0];
+  velocity_std_dev_msg_.standard_deviation.east = packet.standard_deviation[1];
+  velocity_std_dev_msg_.standard_deviation.down = packet.standard_deviation[2];
+  markUpdate(kPacket25Update);
+}
 
+void Driver::eulerStdDevRosDecoder(an_packet_t* an_packet) {
+  euler_orientation_standard_deviation_packet_t packet;
+  if (decode_euler_orientation_standard_deviation_packet(&packet, an_packet) !=
+      0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(euler_std_dev_msg_.header, stamp);
+  setAnppHeader(euler_std_dev_msg_.anpp_header, an_packet);
+  euler_std_dev_msg_.standard_deviation.roll = packet.standard_deviation[0];
+  euler_std_dev_msg_.standard_deviation.pitch = packet.standard_deviation[1];
+  euler_std_dev_msg_.standard_deviation.heading = packet.standard_deviation[2];
 
+  double roll_variance = 0.0;
+  double pitch_variance = 0.0;
+  double heading_variance = 0.0;
+  if (standardDeviationToVariance(packet.standard_deviation[0],
+                                  roll_variance) &&
+      standardDeviationToVariance(packet.standard_deviation[1],
+                                  pitch_variance) &&
+      standardDeviationToVariance(packet.standard_deviation[2],
+                                  heading_variance)) {
+    imu_msg_.orientation_covariance.fill(0.0);
+    imu_msg_.orientation_covariance[0] = roll_variance;
+    imu_msg_.orientation_covariance[4] = pitch_variance;
+    imu_msg_.orientation_covariance[8] = heading_variance;
+  } else {
+    imu_msg_.orientation_covariance.fill(-1.0);
+  }
+  markUpdate(kPacket26Update);
+}
+
+void Driver::nedVelocityRosDecoder(an_packet_t* an_packet) {
+  ned_velocity_packet_t packet;
+  if (decode_ned_velocity_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(ned_velocity_msg_.header, stamp);
+  setAnppHeader(ned_velocity_msg_.anpp_header, an_packet);
+  ned_velocity_msg_.velocity.north = packet.velocity[0];
+  ned_velocity_msg_.velocity.east = packet.velocity[1];
+  ned_velocity_msg_.velocity.down = packet.velocity[2];
+  markUpdate(kPacket35Update);
+}
+
+void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
+  body_velocity_packet_t packet;
+  if (decode_body_velocity_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(body_velocity_msg_.header, stamp);
+  setAnppHeader(body_velocity_msg_.anpp_header, an_packet);
+  body_velocity_msg_.velocity.x = packet.velocity[0];
+  body_velocity_msg_.velocity.y = packet.velocity[1];
+  body_velocity_msg_.velocity.z = packet.velocity[2];
+  markUpdate(kPacket36Update);
+}
+
+void Driver::bodyAccelRosDecoder(an_packet_t* an_packet) {
+  body_acceleration_packet_t packet;
+  if (decode_body_acceleration_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(body_acceleration_msg_.header, stamp);
+  setAnppHeader(body_acceleration_msg_.anpp_header, an_packet);
+  body_acceleration_msg_.body_acceleration.x = packet.acceleration[0];
+  body_acceleration_msg_.body_acceleration.y = packet.acceleration[1];
+  body_acceleration_msg_.body_acceleration.z = packet.acceleration[2];
+  body_acceleration_msg_.g_force = packet.g_force;
+  markUpdate(kPacket38Update);
+}
+
+void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
+  euler_orientation_packet_t packet;
+  if (decode_euler_orientation_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  if (!std::isfinite(packet.orientation[0]) ||
+      !std::isfinite(packet.orientation[1]) ||
+      !std::isfinite(packet.orientation[2])) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Packet 39 orientation contains a non-finite value.");
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(euler_orientation_msg_.header, stamp);
+  setAnppHeader(euler_orientation_msg_.anpp_header, an_packet);
+  euler_orientation_msg_.orientation.roll = packet.orientation[0];
+  euler_orientation_msg_.orientation.pitch = packet.orientation[1];
+  euler_orientation_msg_.orientation.heading = packet.orientation[2];
+
+  orientation_.setRPY(packet.orientation[0], packet.orientation[1],
+                      M_PI / 2.0 - packet.orientation[2]);
+  if (!std::isfinite(orientation_.x()) || !std::isfinite(orientation_.y()) ||
+      !std::isfinite(orientation_.z()) || !std::isfinite(orientation_.w()) ||
+      orientation_.length2() <= 1.0e-12) {
+    return;
+  }
+  orientation_.normalize();
+  imu_msg_.header = euler_orientation_msg_.header;
+  imu_msg_.orientation.x = orientation_.x();
+  imu_msg_.orientation.y = orientation_.y();
+  imu_msg_.orientation.z = orientation_.z();
+  imu_msg_.orientation.w = orientation_.w();
+  pose_msg_.orientation.x = orientation_.x();
+  pose_msg_.orientation.y = orientation_.y();
+  pose_msg_.orientation.z = orientation_.z();
+  pose_msg_.orientation.w = orientation_.w();
+  have_euler_orientation_ = true;
+  markUpdate(kPacket39Update);
+}
+
+void Driver::quaternionOrientRosDecoder(an_packet_t* an_packet) {
+  quaternion_orientation_packet_t packet;
+  if (decode_quaternion_orientation_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(quaternion_orientation_msg_.header, stamp);
+  setAnppHeader(quaternion_orientation_msg_.anpp_header, an_packet);
+  quaternion_orientation_msg_.orientation.w = packet.orientation[0];
+  quaternion_orientation_msg_.orientation.x = packet.orientation[1];
+  quaternion_orientation_msg_.orientation.y = packet.orientation[2];
+  quaternion_orientation_msg_.orientation.z = packet.orientation[3];
+  markUpdate(kPacket40Update);
+}
+
+void Driver::angularVelRosDecoder(an_packet_t* an_packet) {
+  angular_velocity_packet_t packet;
+  if (decode_angular_velocity_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(angular_velocity_msg_.header, stamp);
+  setAnppHeader(angular_velocity_msg_.anpp_header, an_packet);
+  angular_velocity_msg_.angular_velocity.x = packet.angular_velocity[0];
+  angular_velocity_msg_.angular_velocity.y = packet.angular_velocity[1];
+  angular_velocity_msg_.angular_velocity.z = packet.angular_velocity[2];
+  stampHeader(imu_msg_.header, stamp);
+  imu_msg_.angular_velocity.x = packet.angular_velocity[0];
+  imu_msg_.angular_velocity.y = -packet.angular_velocity[1];
+  imu_msg_.angular_velocity.z = -packet.angular_velocity[2];
+  markUpdate(kPacket42Update);
+}
+
+void Driver::angularAccelRosDecoder(an_packet_t* an_packet) {
+  angular_acceleration_packet_t packet;
+  if (decode_angular_acceleration_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(angular_acceleration_msg_.header, stamp);
+  setAnppHeader(angular_acceleration_msg_.anpp_header, an_packet);
+  angular_acceleration_msg_.angular_acceleration.x =
+      packet.angular_acceleration[0];
+  angular_acceleration_msg_.angular_acceleration.y =
+      packet.angular_acceleration[1];
+  angular_acceleration_msg_.angular_acceleration.z =
+      packet.angular_acceleration[2];
+  markUpdate(kPacket43Update);
+}
+
+} // namespace adnav
