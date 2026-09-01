@@ -12,14 +12,12 @@
   <depend>rclcpp</depend>
   <depend>std_msgs</depend>
   <depend>sensor_msgs</depend>
-  <depend>diagnostic_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>tf2</depend>
   <depend>std_srvs</depend>
   <depend>adnav_interfaces</depend>
 
   <!-- <test_depend>ament_lint_auto</test_depend> -->
-  <test_depend>ament_cmake_cpplint</test_depend>
   <test_depend>ament_lint_common</test_depend>
 
   <export>

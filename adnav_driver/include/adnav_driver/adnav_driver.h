@@ -43,21 +43,25 @@
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
 
-#include <rs232.h>
-#include <an_packet_protocol.h>
-#include <ins_packets.h>
-#include <adnav_utils.h>
+#include "packet_contract.hpp"
 #include <adnav_comms.h>
 #include <adnav_logger.h>
 #include <adnav_ntrip.h>
+#include <adnav_utils.h>
+#include <an_packet_protocol.h>
+#include <ins_packets.h>
+#include <rs232.h>
 
 // Adnav_interfaces
+#include <adnav_interfaces/msg/filter_status.hpp>
+#include <adnav_interfaces/msg/llh.hpp>
+#include <adnav_interfaces/msg/status_packet.hpp>
+#include <adnav_interfaces/msg/system_status.hpp>
+#include <adnav_interfaces/srv/installation_alignment.hpp>
+#include <adnav_interfaces/srv/ntrip.hpp>
 #include <adnav_interfaces/srv/packet_periods.hpp>
 #include <adnav_interfaces/srv/packet_timer_period.hpp>
 #include <adnav_interfaces/srv/request_packets.hpp>
-#include <adnav_interfaces/srv/ntrip.hpp>
-#include <adnav_interfaces/srv/installation_alignment.hpp>
-#include <adnav_interfaces/msg/llh.hpp>
 // ADV-153: Phase 3 message definitions for lightweight per-packet raw topics
 #include <adnav_interfaces/msg/position_std_dev.hpp>
 #include <adnav_interfaces/msg/velocity_std_dev.hpp>
@@ -72,20 +76,20 @@
 #include <adnav_interfaces/msg/angular_acceleration.hpp>
 
 // ROS2 Packages, Services, Messages
-#include <rclcpp/rclcpp.hpp>
-#include <tf2/LinearMath/Quaternion.h>
-#include <rcl_interfaces/msg/set_parameters_result.hpp>
-#include <std_msgs/msg/string.hpp>
-#include <sensor_msgs/msg/nav_sat_fix.hpp>
-#include <sensor_msgs/msg/time_reference.hpp>
-#include <sensor_msgs/msg/imu.hpp>
-#include <geometry_msgs/msg/twist.hpp>
 #include <geometry_msgs/msg/pose.hpp>
-#include <diagnostic_msgs/msg/diagnostic_array.hpp>
-#include <sensor_msgs/msg/magnetic_field.hpp>
-#include <sensor_msgs/msg/temperature.hpp>
+#include <geometry_msgs/msg/twist.hpp>
+#include <rcl_interfaces/msg/set_parameters_result.hpp>
+#include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <sensor_msgs/msg/magnetic_field.hpp>
+#include <sensor_msgs/msg/nav_sat_fix.hpp>
+#include <sensor_msgs/msg/temperature.hpp>
+#include <sensor_msgs/msg/time_reference.hpp>
+#include <std_msgs/msg/header.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/empty.hpp>
+#include <tf2/LinearMath/Quaternion.h>
 
 #if defined(WIN32) || defined(_WIN32)
     #pragma comment(lib, "ws2_32.lib")  // Winsock Library
@@ -114,8 +118,10 @@ constexpr const int    DEFAULT_BAUD_RATE = 115200;
 constexpr const int    DEFAULT_TIMER_PERIOD = 20000;
 constexpr const int    DEFAULT_PACKET_TIMER_PERIOD = 10000;
 constexpr const char * DEFAULT_COM_PORT = "ttyUSB0";
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10";
+constexpr const int DEFAULT_PACKET_REQUEST[16] = {
+    20, 10, 23, 10, 24, 10, 25, 10, 26, 10, 28, 10, 39, 10, 42, 10};
+constexpr const char *DEFAULT_PACKET_REQUEST_STR =
+    "20, 10, 23, 10, 24, 10, 25, 10, 26, 10, 28, 10, 39, 10, 42, 10";
 constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
 constexpr const bool   DEFAULT_NTRIP_STATE = false;
 constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
@@ -191,8 +197,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153: Packet-20 linear and angular velocity source for the bridge's /ins/twist topic.
     geometry_msgs::msg::Twist       twist_msg_;
     geometry_msgs::msg::Pose        pose_msg_;
-    diagnostic_msgs::msg::DiagnosticStatus system_status_msg_;
-    diagnostic_msgs::msg::DiagnosticStatus filter_status_msg_;
+    adnav_interfaces::msg::SystemStatus system_status_msg_;
+    adnav_interfaces::msg::FilterStatus filter_status_msg_;
+    adnav_interfaces::msg::StatusPacket status_packet_msg_;
 
     // ADV-153 Phase 3: lightweight per-packet raw messages.
     adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
@@ -206,6 +213,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     adnav_interfaces::msg::AngularVelocity         angular_velocity_msg_;
     adnav_interfaces::msg::NedVelocity             ned_velocity_msg_;
     adnav_interfaces::msg::AngularAcceleration     angular_acceleration_msg_;
+    bool have_ecef_position_ = false;
 
     // Publishers
     rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr             		imu_pub_;
@@ -217,17 +225,25 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153: consumed by atlas_ins_odom_bridge for /ins/twist.
     rclcpp::Publisher<geometry_msgs::msg::Twist>::SharedPtr 				twist_pub_;
     rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr 					pose_pub_;
-    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	system_status_pub_;
-    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr 	filter_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::SystemStatus>::SharedPtr
+        system_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::FilterStatus>::SharedPtr
+        filter_status_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::StatusPacket>::SharedPtr
+        status_pub_;
 
     // ADV-153 Phase 3: lightweight per-packet raw topic publishers
     rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::QuaternionStdDev>::SharedPtr      quaternion_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerStdDev>::SharedPtr
+        euler_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::BodyVelocity>::SharedPtr          body_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr
+        euler_orientation_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
 
@@ -264,8 +280,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     // Threading variables
     std::mutex messages_mutex_;
-    std::condition_variable msg_cv_;
-    bool msg_write_done_;
+    uint32_t pending_updates_ = 0;
+    bool have_euler_orientation_ = false;
 
     std::mutex acknowledge_mutex_;
     std::condition_variable srv_cv_;
@@ -298,8 +314,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     //~~~~~~ Logging Functions
     void openLogFile();
-    void statusErrLog(const std::string& errmsg);
-    void statusWarnLog(const std::string& warnmsg);
+    rclcpp::Time receiptTime();
+    rclcpp::Time packet20Time(const system_state_packet_t &packet,
+                              const rclcpp::Time &receipt);
+    void stampHeader(std_msgs::msg::Header &header, const rclcpp::Time &stamp);
+    void markUpdate(uint32_t update);
 
     //~~~~~~ ROS Services
     void srvPacketPeriods(const std::shared_ptr<adnav_interfaces::srv::PacketPeriods::Request> request,

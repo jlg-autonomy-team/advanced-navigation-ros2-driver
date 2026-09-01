@@ -171,7 +171,8 @@ You can view the topics published to by the driver using the `ros2 topic` comman
       /parameter_events: rcl_interfaces/msg/ParameterEvent
     Publishers:
       /barometric_pressure: sensor_msgs/msg/FluidPressure
-      /filter_status: diagnostic_msgs/msg/DiagnosticStatus
+      /filter_status: adnav_interfaces/msg/FilterStatus
+      /status: adnav_interfaces/msg/StatusPacket
       /gnss_fix_type: std_msgs/msg/String
       /imu: sensor_msgs/msg/Imu
       /magnetic_field: sensor_msgs/msg/MagneticField
@@ -179,7 +180,7 @@ You can view the topics published to by the driver using the `ros2 topic` comman
       /parameter_events: rcl_interfaces/msg/ParameterEvent
       /pose: geometry_msgs/msg/Pose
       /rosout: rcl_interfaces/msg/Log
-      /system_status: diagnostic_msgs/msg/DiagnosticStatus
+      /system_status: adnav_interfaces/msg/SystemStatus
       /tempurature: sensor_msgs/msg/Temperature
       /twist: geometry_msgs/msg/Twist
     Service Servers:
