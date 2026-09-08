@@ -39,6 +39,7 @@
 #include <functional>   // std::placeholder
 #include <memory>       // smart pointers
 #include <vector>       // std::vector
+#include <array>        // std::array
 #include <string>       // std::string
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
@@ -171,6 +172,27 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::vector<int64_t> packet_request_;
     int packet_timer_period_;
 
+    // ADV-153: Dual Antenna Configuration (ANPP 196) - sent once at startup from YAML params
+    // (not a runtime service) since it describes a fixed physical antenna mounting, same as
+    // frame_id_. Disabled by default so single-antenna platforms are unaffected.
+    bool dual_antenna_configuration_enabled_ = false;
+    bool dual_antenna_automatic_offset_enabled_ = true;
+    uint8_t dual_antenna_automatic_offset_orientation_ = 0;
+    std::array<float, 3> dual_antenna_manual_offset_ = {0.0f, 0.0f, 0.0f};
+    bool dual_antenna_configuration_permanent_ = true;
+
+    // ADV-153: primary GNSS antenna's lever arm offset from the IMU reference point, in metres,
+    // FRD body frame - part of the Installation Alignment Packet (ANPP 185), included in every
+    // SendInstallationAlignment() call regardless of caller (see that function's doc comment).
+    // Sent once at startup (roll=pitch=0, not the dynamic calibration) only if enabled, since it
+    // describes a fixed physical measurement like dual_antenna_manual_offset_ above.
+    std::array<float, 3> gnss_antenna_offset_ = {0.0f, 0.0f, 0.0f};
+    bool gnss_antenna_offset_configuration_enabled_ = false;
+    // Defaults to non-permanent: this startup call always uses roll=pitch=0, so making it
+    // permanent would silently reset any previously permanently-calibrated installation
+    // alignment roll/pitch back to zero on every normal boot.
+    bool gnss_antenna_offset_configuration_permanent_ = false;
+
     // Log files.
     std::string log_path_;
     adnav::Logger anpp_logger_;
@@ -267,6 +289,34 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::condition_variable msg_cv_;
     bool msg_write_done_;
 
+    // ADV-153: per-topic "has new data since the last publish tick" tracking. publishTimerCallback()
+    // previously republished every cached message on every tick once ANY decoder ran (msg_write_done_
+    // is shared across all of them), so topics whose underlying packet hadn't actually been
+    // re-decoded since the last tick got duplicate publishes with stale/repeated content and
+    // timestamps. Each decoder now only marks its own message(s) dirty on a successful decode, and
+    // publishTimerCallback() only publishes (and clears) topics that are actually dirty.
+    struct DirtyFlags {
+        bool nav_sat_fix = false;
+        bool twist = false;
+        bool imu = false;
+        bool imu_raw = false;
+        bool system_status = false;
+        bool filter_status = false;
+        bool magnetic_field = false;
+        bool barometric_pressure = false;
+        bool temperature = false;
+        bool pose = false;
+        bool position_std_dev = false;
+        bool velocity_std_dev = false;
+        bool ned_velocity = false;
+        bool quaternion_std_dev = false;
+        bool body_velocity = false;
+        bool body_acceleration = false;
+        bool quaternion_orientation = false;
+        bool angular_velocity = false;
+        bool angular_acceleration = false;
+    } dirty_;  // only access with protection of messages_mutex_, same as the msgs themselves
+
     std::mutex acknowledge_mutex_;
     std::condition_variable srv_cv_;
     bool acknowledge_recieve_;
@@ -343,6 +393,11 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153: sends an Installation Alignment Packet (ANPP 185) built from a roll/pitch offset
     // only (yaw offset always 0 - see InstallationAlignment.srv for the full rationale).
     adnav_interfaces::msg::RawAcknowledge SendInstallationAlignment(double roll, double pitch, bool permanent = true);
+    // ADV-153: sends a Dual Antenna Configuration Packet (ANPP 196) built from the
+    // dual_antenna_* parameters - see deviceSetup().
+    adnav_interfaces::msg::RawAcknowledge SendDualAntennaConfiguration(
+        bool automatic_offset_enabled, uint8_t automatic_offset_orientation,
+        const std::array<float, 3>& manual_offset, bool permanent = true);
 
     //~~~~~~ Decoders
     void decodePackets(an_decoder_t &an_decoder, const int &bytes_received);
