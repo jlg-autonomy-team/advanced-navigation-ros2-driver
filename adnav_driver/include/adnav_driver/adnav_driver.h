@@ -250,6 +250,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<adnav_interfaces::msg::BodyVelocity>::SharedPtr          body_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr      euler_orientation_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
 
@@ -313,6 +314,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
         bool body_velocity = false;
         bool body_acceleration = false;
         bool quaternion_orientation = false;
+        bool euler_orientation = false;
         bool angular_velocity = false;
         bool angular_acceleration = false;
     } dirty_;  // only access with protection of messages_mutex_, same as the msgs themselves

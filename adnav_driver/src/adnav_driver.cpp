@@ -228,6 +228,7 @@ void Driver::createPublishers() {
 	body_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::BodyVelocity>(std::string(node_name_ + "/body_velocity"), 10);
 	body_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::BodyAcceleration>(std::string(node_name_ + "/body_acceleration"), 10);
 	quaternion_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::QuaternionOrientation>(std::string(node_name_ + "/quaternion_orientation"), 10);
+	euler_orientation_pub_ = this->create_publisher<adnav_interfaces::msg::EulerOrientation>(std::string(node_name_ + "/euler_orientation"), 10);
 	angular_velocity_pub_ = this->create_publisher<adnav_interfaces::msg::AngularVelocity>(std::string(node_name_ + "/angular_velocity"), 10);
 	angular_acceleration_pub_ = this->create_publisher<adnav_interfaces::msg::AngularAcceleration>(std::string(node_name_ + "/angular_acceleration"), 10);
 }
@@ -783,6 +784,7 @@ void Driver::publishTimerCallback() {
 	if (dirty_.body_velocity) { body_velocity_pub_->publish(body_velocity_msg_); dirty_.body_velocity = false; }
 	if (dirty_.body_acceleration) { body_acceleration_pub_->publish(body_acceleration_msg_); dirty_.body_acceleration = false; }
 	if (dirty_.quaternion_orientation) { quaternion_orientation_pub_->publish(quaternion_orientation_msg_); dirty_.quaternion_orientation = false; }
+	if (dirty_.euler_orientation) { euler_orientation_pub_->publish(euler_orientation_msg_); dirty_.euler_orientation = false; }
 	if (dirty_.angular_velocity) { angular_velocity_pub_->publish(angular_velocity_msg_); dirty_.angular_velocity = false; }
 	if (dirty_.angular_acceleration) { angular_acceleration_pub_->publish(angular_acceleration_msg_); dirty_.angular_acceleration = false; }
 
@@ -2530,8 +2532,9 @@ void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
 		pose_msg_.orientation.x = orientation_[0];
 		pose_msg_.orientation.y = orientation_[1];
 		pose_msg_.orientation.z = orientation_[2];
-		pose_msg_.orientation.w = orientation_[3];
-		dirty_.imu = true;
+				pose_msg_.orientation.w = orientation_[3];
+				dirty_.euler_orientation = true;
+				dirty_.imu = true;
 		dirty_.pose = true;
 	}
 	msg_write_done_ = true;
