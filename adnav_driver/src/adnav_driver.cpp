@@ -1852,6 +1852,9 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_body_acceleration: bodyAccelRosDecoder(an_packet);
 				break;
 
+			case packet_id_ecef_position: ecefPosRosDecoder(an_packet);
+				break;
+
 			case packet_id_quaternion_orientation: quaternionOrientRosDecoder(an_packet);
 				break;
 
@@ -1998,7 +2001,7 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
 
 
 			// ADV-153: imu_msg_.orientation and imu_msg_.angular_velocity come from packets 39 and
-			// 42. Linear acceleration is sourced from packet 28 through imu_raw_msg_.
+			// 42. Linear acceleration is sourced from packet 38; packet 28 feeds imu_raw_msg_.
 			// imu_msg_.header.stamp uses the driver's own clock (see nav_fix_msg_ above), not
 			// packet 20's GNSS/UTC time, so it stays monotonic like every other decoded topic.
 			imu_msg_.header.stamp = this->get_clock()->now();
@@ -2098,15 +2101,17 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 
 	// Fill the messages
 	if(decode_raw_sensors_packet(&raw_sensors_packet, an_packet) == 0) {
+		const auto stamp = this->get_clock()->now();
 
 		// RAW MAGNETICFIELD VALUE FROM IMU
+		mag_field_msg_.header.stamp = stamp;
 		mag_field_msg_.header.frame_id = frame_id_;
 		mag_field_msg_.magnetic_field.x = raw_sensors_packet.magnetometers[0];
 		mag_field_msg_.magnetic_field.y = raw_sensors_packet.magnetometers[1];
 		mag_field_msg_.magnetic_field.z = raw_sensors_packet.magnetometers[2];
 
-		// Packet 28 carries no timestamp of its own; reuse the last packet-20 time like imu_msg_.
-		imu_raw_msg_.header.stamp = imu_msg_.header.stamp;
+		// Packet 28 carries no timestamp of its own; use the driver clock at decode time.
+		imu_raw_msg_.header.stamp = stamp;
 		imu_raw_msg_.header.frame_id = frame_id_;
 		imu_raw_msg_.orientation_covariance[0] = -1; // Tell recievers that no orientation is sent.
 		// ADV-153: imu_link is defined FRD in robot_description (see imu_link_to_base_joint's
@@ -2119,10 +2124,12 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
 		imu_raw_msg_.angular_velocity.z = raw_sensors_packet.gyroscopes[2];
 
 		// BAROMETRIC PRESSURE
+		baro_msg_.header.stamp = stamp;
 		baro_msg_.header.frame_id = frame_id_;
 		baro_msg_.fluid_pressure = raw_sensors_packet.pressure;
 
 		// TEMPERATURE
+		temp_msg_.header.stamp = stamp;
 		temp_msg_.header.frame_id = frame_id_;
 		temp_msg_.temperature = raw_sensors_packet.pressure_temperature;
 
@@ -2390,6 +2397,7 @@ void Driver::eulerStdDevRosDecoder(an_packet_t* an_packet) {
 		imu_msg_.orientation_covariance[0] = pow(euler_orientation_standard_deviation_packet.standard_deviation[0], 2);
 		imu_msg_.orientation_covariance[4] = pow(euler_orientation_standard_deviation_packet.standard_deviation[1], 2);
 		imu_msg_.orientation_covariance[8] = pow(euler_orientation_standard_deviation_packet.standard_deviation[2], 2);
+		imu_msg_.header.stamp = this->get_clock()->now();
 		dirty_.imu = true;
 	}
 	msg_write_done_ = true;
@@ -2454,8 +2462,8 @@ void Driver::bodyVelocityRosDecoder(an_packet_t* an_packet) {
 /**
  * @brief Function to decode the Body Acceleration ANPP Packet (ANPP.38).
  *
- * Publishes the decoded body acceleration on the diagnostic topic. The estimated IMU's linear
- * acceleration is sourced only from packet 28 through imu_raw_msg_.
+ * Publishes the decoded body acceleration on the diagnostic topic and feeds the estimated IMU's
+ * linear acceleration.
  *
  * @param an_packet a pointer to an an_packet_t object which will be decoded.
  */
@@ -2476,7 +2484,12 @@ void Driver::bodyAccelRosDecoder(an_packet_t* an_packet) {
 		body_acceleration_msg_.body_acceleration.y = body_acceleration_packet.acceleration[1];
 		body_acceleration_msg_.body_acceleration.z = body_acceleration_packet.acceleration[2];
 		body_acceleration_msg_.g_force = body_acceleration_packet.g_force;
+		imu_msg_.linear_acceleration.x = body_acceleration_packet.acceleration[0];
+		imu_msg_.linear_acceleration.y = body_acceleration_packet.acceleration[1];
+		imu_msg_.linear_acceleration.z = body_acceleration_packet.acceleration[2];
+		imu_msg_.header.stamp = this->get_clock()->now();
 		dirty_.body_acceleration = true;
+		dirty_.imu = true;
 	}
 	msg_write_done_ = true;
 	msg_cv_.notify_one();
@@ -2533,6 +2546,7 @@ void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
 		pose_msg_.orientation.y = orientation_[1];
 		pose_msg_.orientation.z = orientation_[2];
 				pose_msg_.orientation.w = orientation_[3];
+				imu_msg_.header.stamp = this->get_clock()->now();
 				dirty_.euler_orientation = true;
 				dirty_.imu = true;
 		dirty_.pose = true;
@@ -2600,6 +2614,7 @@ void Driver::angularVelRosDecoder(an_packet_t* an_packet) {
 		imu_msg_.angular_velocity.x = angular_velocity_packet.angular_velocity[0];
 		imu_msg_.angular_velocity.y = angular_velocity_packet.angular_velocity[1];
 		imu_msg_.angular_velocity.z = angular_velocity_packet.angular_velocity[2];
+		imu_msg_.header.stamp = this->get_clock()->now();
 		dirty_.angular_velocity = true;
 		dirty_.imu = true;
 	}

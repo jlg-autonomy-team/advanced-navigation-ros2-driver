@@ -1,4 +1,3 @@
 [submodule "an-ros-common"]
 	path = an-ros-common
 	url = ../an-ros-common.git
-	branch = ADV-153-integrate-certus-mini-d

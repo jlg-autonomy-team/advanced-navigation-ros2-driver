@@ -115,8 +115,19 @@ constexpr const int    DEFAULT_BAUD_RATE = 115200;
 constexpr const int    DEFAULT_TIMER_PERIOD = 20000;
 constexpr const int    DEFAULT_PACKET_TIMER_PERIOD = 10000;
 constexpr const char * DEFAULT_COM_PORT = "ttyUSB0";
-constexpr const int    DEFAULT_PACKET_REQUEST[4] = {20, 10, 28, 10};
-constexpr const char * DEFAULT_PACKET_REQUEST_STR = "20, 10, 28, 10";
+constexpr const int    DEFAULT_PACKET_REQUEST[18] = {
+    20, 10,
+    23, 10,
+    24, 10,
+    25, 10,
+    26, 10,
+    28, 10,
+    39, 10,
+    42, 10,
+    43, 10
+};
+constexpr const char * DEFAULT_PACKET_REQUEST_STR =
+    "20, 10, 23, 10, 24, 10, 25, 10, 26, 10, 28, 10, 39, 10, 42, 10, 43, 10";
 constexpr const char * DEFAULT_IP_ADDRESS = "0.0.0.0";
 constexpr const bool   DEFAULT_NTRIP_STATE = false;
 constexpr const int    DEFAULT_GPGGA_REPORT_PERIOD = 1;  // Second(s)
