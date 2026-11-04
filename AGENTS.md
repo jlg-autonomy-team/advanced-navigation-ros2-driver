@@ -7,7 +7,7 @@ This is a git submodule in the ROS 2 Jazzy workspace `/Data/ADV/certus_eval`. Wo
 ## Ownership boundaries
 
 - `adnav_driver`: C++ device node, ANPP decoding, ROS publication/services, transport selection, and logging.
-- `adnav_interfaces`: ROS interface package. Its definitions are sourced from the vendored `an-ros-common` submodule; treat that checkout as vendor-owned and leave it untouched unless explicitly assigned.
+- `adnav_interfaces`: ROS interface package. Its definitions are sourced from the `an-ros-common` submodule, which is our fork; new or changed messages go there and may be edited when a driver change needs them.
 - `adnav_launch`: launch entrypoints and transport-specific YAML profiles.
 - `atlas_ins_odom_bridge` owns derived covariance-aware odometry; `atlas_ntrip_client` is the separate higher-level NTRIP supervisor.
 
@@ -41,7 +41,7 @@ colcon build --cmake-args -DCMAKE_EXPORT_COMPILE_COMMANDS=ON --event-handlers co
 
 ## Generated and sensitive files
 
-Do not commit workspace `build/`, `install/`, or `log/` trees, generated compilation databases, device capture/log files (`Log_*.anpp`, `*.rtcm`), or credentials. Do not edit files inside `an-ros-common` for ordinary driver tasks.
+Do not commit workspace `build/`, `install/`, or `log/` trees, generated compilation databases, device capture/log files (`Log_*.anpp`, `*.rtcm`), or credentials. `an-ros-common` is our fork and may be edited (for example to add message definitions); keep edits there limited to what the driver change requires.
 
 ## Serena navigation
 

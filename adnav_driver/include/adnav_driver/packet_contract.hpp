@@ -23,6 +23,7 @@ constexpr uint32_t kPacket39Update = 1u << 11;
 constexpr uint32_t kPacket40Update = 1u << 12;
 constexpr uint32_t kPacket42Update = 1u << 13;
 constexpr uint32_t kPacket43Update = 1u << 14;
+constexpr uint32_t kPacket51Update = 1u << 15;
 
 // Packet 39 is the live orientation source used before heading initialization.
 inline bool isRosDriverPacketId(int64_t packet_id) {
@@ -44,6 +45,7 @@ inline bool isRosDriverPacketId(int64_t packet_id) {
   case packet_id_quaternion_orientation:
   case packet_id_angular_velocity:
   case packet_id_angular_acceleration:
+  case packet_id_odometer_state:
     return true;
   default:
     return false;
@@ -82,6 +84,8 @@ inline uint32_t rosDriverPendingUpdateForPacket(int64_t packet_id) {
     return kPacket42Update;
   case packet_id_angular_acceleration:
     return kPacket43Update;
+  case packet_id_odometer_state:
+    return kPacket51Update;
   default:
     return 0;
   }

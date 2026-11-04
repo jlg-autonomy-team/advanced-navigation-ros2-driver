@@ -107,6 +107,7 @@ Driver::Driver() : rclcpp::Node("adnav_driver") {
 
   // Create Publishers for the node
   createPublishers();
+  createSubscriptions();
   // No ANPP packet currently provides angular-rate or linear-acceleration
   // standard deviations. ROS Imu uses a -1 diagonal entry to indicate that a
   // covariance is unavailable; leaving the default zero array would incorrectly
@@ -270,6 +271,9 @@ void Driver::createPublishers() {
         velocity_std_dev_pub_ =
             this->create_publisher<adnav_interfaces::msg::VelocityStdDev>(
                 std::string(node_name_ + "/velocity_std_dev"), 10);
+        odometer_state_pub_ =
+            this->create_publisher<adnav_interfaces::msg::OdometerState>(
+                std::string(node_name_ + "/odometer_state"), 10);
         ned_velocity_pub_ =
             this->create_publisher<adnav_interfaces::msg::NedVelocity>(
                 std::string(node_name_ + "/ned_velocity"), 10);
@@ -297,6 +301,64 @@ void Driver::createPublishers() {
         angular_acceleration_pub_ =
             this->create_publisher<adnav_interfaces::msg::AngularAcceleration>(
                 std::string(node_name_ + "/angular_acceleration"), 10);
+}
+
+/**
+ * @brief Function to subscribe to wheel odometry and forward it to the device.
+ *
+ * Set the wheel_odom_topic parameter to an empty string to disable forwarding.
+ */
+void Driver::createSubscriptions() {
+  rcl_interfaces::msg::ParameterDescriptor topic_description;
+  topic_description.description =
+      "Odometry topic forwarded to the INS as external odometer packets. Empty disables.";
+  this->declare_parameter<std::string>("wheel_odom_topic", "odometry/wheel", topic_description);
+  const std::string topic = this->get_parameter("wheel_odom_topic").as_string();
+  if (topic.empty()) {
+    return;
+  }
+
+  // Shares the service group so device writes are serialized with service writes.
+  rclcpp::SubscriptionOptions options;
+  options.callback_group = service_group_;
+  wheel_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+      topic, 10,
+      std::bind(&Driver::wheelOdomCallback, this, std::placeholders::_1),
+      options);
+}
+
+/**
+ * @brief Encode a wheel odometry message as an ANPP external odometer packet (67).
+ *
+ * @param msg Odometry whose twist linear.x is the forward speed in m/s.
+ */
+void Driver::wheelOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  const rclcpp::Time stamp(msg->header.stamp, this->get_clock()->get_clock_type());
+  const rclcpp::Time now = this->get_clock()->now();
+  const double delay = std::max(0.0, (now - stamp).seconds());
+
+  const double speed = msg->twist.twist.linear.x;
+  if (have_last_wheel_stamp_ && stamp > last_wheel_stamp_) {
+    wheel_distance_m_ += std::abs(speed) * (stamp - last_wheel_stamp_).seconds();
+  }
+  last_wheel_stamp_ = stamp;
+  have_last_wheel_stamp_ = true;
+
+  odometer_packet_t odometer{};
+  odometer.delay = static_cast<float>(delay);
+  odometer.speed = static_cast<float>(speed);
+  odometer.distance_travelled = static_cast<float>(wheel_distance_m_);
+  // Signed speed is sent as-is, so the device must treat negative speed as reverse.
+  odometer.flags.r = 0;
+  odometer.flags.b.reverse_detection_supported = 1;
+
+  an_packet_t* an_packet = encode_external_odometer_packet(&odometer);
+  if (an_packet == nullptr) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Failed to allocate external odometer packet");
+    return;
+  }
+  encodeAndSend(an_packet);
 }
 
 /**
@@ -817,6 +879,9 @@ void Driver::publishTimerCallback() {
         }
         if (updates & kPacket43Update) {
           angular_acceleration_pub_->publish(angular_acceleration_msg_);
+        }
+        if (updates & kPacket51Update) {
+          odometer_state_pub_->publish(odometer_state_msg_);
         }
 
         RCLCPP_DEBUG(this->get_logger(), "Published updates 0x%08x (cycle %d)",
@@ -1794,6 +1859,9 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_velocity_standard_deviation: velocityStdDevRosDecoder(an_packet);
 				break;
 
+			case packet_id_odometer_state: odometerStateRosDecoder(an_packet);
+				break;
+
 			case packet_id_ned_velocity: nedVelocityRosDecoder(an_packet);
 				break;
 
@@ -2153,6 +2221,23 @@ void Driver::velocityStdDevRosDecoder(an_packet_t* an_packet) {
   velocity_std_dev_msg_.standard_deviation.east = packet.standard_deviation[1];
   velocity_std_dev_msg_.standard_deviation.down = packet.standard_deviation[2];
   markUpdate(kPacket25Update);
+}
+
+void Driver::odometerStateRosDecoder(an_packet_t* an_packet) {
+  odometer_state_packet_t packet;
+  if (decode_odometer_state_packet(&packet, an_packet) != 0) {
+    return;
+  }
+  const auto stamp = receiptTime();
+  std::unique_lock<std::mutex> lock(messages_mutex_);
+  stampHeader(odometer_state_msg_.header, stamp);
+  setAnppHeader(odometer_state_msg_.anpp_header, an_packet);
+  odometer_state_msg_.pulse_count = packet.pulse_count;
+  odometer_state_msg_.distance = packet.distance;
+  odometer_state_msg_.speed = packet.speed;
+  odometer_state_msg_.slip = packet.slip;
+  odometer_state_msg_.active = packet.active != 0;
+  markUpdate(kPacket51Update);
 }
 
 void Driver::eulerStdDevRosDecoder(an_packet_t* an_packet) {

@@ -35,6 +35,7 @@
 #include <fstream>
 
 // C++ System Headers
+#include <algorithm>    // std::max
 #include <chrono>       // Time, std::chrono
 #include <functional>   // std::placeholder
 #include <memory>       // smart pointers
@@ -65,6 +66,7 @@
 // ADV-153: Phase 3 message definitions for lightweight per-packet raw topics
 #include <adnav_interfaces/msg/position_std_dev.hpp>
 #include <adnav_interfaces/msg/velocity_std_dev.hpp>
+#include <adnav_interfaces/msg/odometer_state.hpp>
 #include <adnav_interfaces/msg/quaternion_std_dev.hpp>
 #include <adnav_interfaces/msg/euler_std_dev.hpp>
 #include <adnav_interfaces/msg/body_velocity.hpp>
@@ -78,6 +80,7 @@
 // ROS2 Packages, Services, Messages
 #include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/fluid_pressure.hpp>
@@ -204,6 +207,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153 Phase 3: lightweight per-packet raw messages.
     adnav_interfaces::msg::PositionStdDev          position_std_dev_msg_;
     adnav_interfaces::msg::VelocityStdDev          velocity_std_dev_msg_;
+    adnav_interfaces::msg::OdometerState           odometer_state_msg_;
     adnav_interfaces::msg::QuaternionStdDev         quaternion_std_dev_msg_;
     adnav_interfaces::msg::EulerStdDev              euler_std_dev_msg_;
     adnav_interfaces::msg::BodyVelocity             body_velocity_msg_;
@@ -235,6 +239,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     // ADV-153 Phase 3: lightweight per-packet raw topic publishers
     rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
+    rclcpp::Publisher<adnav_interfaces::msg::OdometerState>::SharedPtr         odometer_state_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::QuaternionStdDev>::SharedPtr      quaternion_std_dev_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::EulerStdDev>::SharedPtr
@@ -261,6 +266,12 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::shared_ptr<rclcpp::ParameterCallbackHandle> read_us_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_request_cb_;
     std::shared_ptr<rclcpp::ParameterCallbackHandle> packet_timer_cb_;
+
+    // Wheel odometry forwarded to the INS as external odometer packets (ANPP 67)
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr wheel_odom_sub_;
+    double wheel_distance_m_ = 0.0;
+    bool have_last_wheel_stamp_ = false;
+    rclcpp::Time last_wheel_stamp_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -300,6 +311,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void waitForDevicePacket();
     void requestDeviceInfo();
     void createPublishers();
+    void createSubscriptions();
     void createServices();
     void deviceSetup();
     void pumpAndLogAcknowledge(const std::string& label);
@@ -309,6 +321,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     //~~~~~~ Control Functions
     void recievePackets();
     void publishTimerCallback();
+    void wheelOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void RestartPublisher();
     void RestartReader();
 
@@ -375,6 +388,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void statusRosDecoder(an_packet_t* an_packet);
     void positionStdDevRosDecoder(an_packet_t* an_packet);
     void velocityStdDevRosDecoder(an_packet_t* an_packet);
+    void odometerStateRosDecoder(an_packet_t* an_packet);
     void bodyVelocityRosDecoder(an_packet_t* an_packet);
     void bodyAccelRosDecoder(an_packet_t* an_packet);
     void quaternionOrientRosDecoder(an_packet_t* an_packet);

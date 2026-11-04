@@ -57,6 +57,7 @@ adnav_node:
       39, 4,    # Euler Orientation -> imu.orientation (ROS ENU yaw remap)
       42, 4,    # Angular Velocity -> imu.angular_velocity (twist angular velocity source)
       43, 4,    # Angular Acceleration (diagnostic only)
+      51, 4,    # Odometer State (external wheel odometer status)
     ]
     
     # The size of the packet period in Microseconds. 
