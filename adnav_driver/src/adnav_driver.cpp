@@ -311,15 +311,29 @@ void Driver::createPublishers() {
 /**
  * @brief Function to subscribe to wheel odometry and forward it to the device.
  *
- * Set the wheel_odom_topic parameter to an empty string to disable forwarding.
+ * Set wheel_odom_enabled to true to enable forwarding; an empty wheel_odom_topic also disables it.
  */
 void Driver::createSubscriptions() {
+  rcl_interfaces::msg::ParameterDescriptor enable_description;
+  enable_description.description =
+      "When true, forward wheel odometry to the INS as external odometer packets.";
+  this->declare_parameter<bool>("wheel_odom_enabled", false, enable_description);
+  const bool wheel_odom_enabled = this->get_parameter("wheel_odom_enabled").as_bool();
+
   rcl_interfaces::msg::ParameterDescriptor topic_description;
   topic_description.description =
       "Odometry topic forwarded to the INS as external odometer packets. Empty disables.";
   this->declare_parameter<std::string>("wheel_odom_topic", "odometry/wheel", topic_description);
   const std::string topic = this->get_parameter("wheel_odom_topic").as_string();
+
+  if (!wheel_odom_enabled) {
+    RCLCPP_INFO(this->get_logger(),
+                "INS wheel odometry aiding is disabled (wheel_odom_enabled=false)");
+    return;
+  }
   if (topic.empty()) {
+    RCLCPP_INFO(this->get_logger(),
+                "INS wheel odometry aiding is disabled (wheel_odom_topic is empty)");
     return;
   }
 
