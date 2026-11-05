@@ -13,8 +13,8 @@ find_package(geometry_msgs REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 
 # Declare message and service files from an-ros-common
-file(GLOB msg_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/msg/*.msg")
-file(GLOB srv_files RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/srv/*.srv")
+file(GLOB msg_files CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/msg/*.msg")
+file(GLOB srv_files CONFIGURE_DEPENDS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} "../an-ros-common/srv/*.srv")
 
 # Build the message interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
