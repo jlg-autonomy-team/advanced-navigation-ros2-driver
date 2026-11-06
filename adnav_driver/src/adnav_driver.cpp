@@ -2339,7 +2339,9 @@ void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
   euler_orientation_msg_.orientation.pitch = packet.orientation[1];
   euler_orientation_msg_.orientation.heading = packet.orientation[2];
 
-  orientation_.setRPY(packet.orientation[0], packet.orientation[1],
+  // ANPP orientation is FRD/NED (pitch positive nose up, heading clockwise from north); ROS is FLU/ENU, where pitch is
+  // positive nose down. Negating pitch matches the FRD to FLU gyro and accelerometer conversion done for packet 28.
+  orientation_.setRPY(packet.orientation[0], -packet.orientation[1],
                       M_PI / 2.0 - packet.orientation[2]);
   if (!std::isfinite(orientation_.x()) || !std::isfinite(orientation_.y()) ||
       !std::isfinite(orientation_.z()) || !std::isfinite(orientation_.w()) ||

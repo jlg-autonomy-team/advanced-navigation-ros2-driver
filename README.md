@@ -31,7 +31,7 @@ The launch profile names the node `adnav_node` (the C++ node's own default name 
 
 | Interface | Type | QoS / details |
 |---|---|---|
-| `/adnav_node/imu` | `sensor_msgs/msg/Imu` | Keep-last depth 10; device orientation/angular-rate values where decoded; covariance `-1` marks unavailable estimates. |
+| `/adnav_node/imu` | `sensor_msgs/msg/Imu` | Keep-last depth 10; device orientation/angular-rate values where decoded, converted to ROS conventions (ENU yaw, pitch positive nose down; the raw ANPP angles stay in `euler_orientation`); covariance `-1` marks unavailable estimates. |
 | `/adnav_node/imu_raw` | `sensor_msgs/msg/Imu` | Keep-last depth 10; raw-sensor packet values. |
 | `/adnav_node/nav_sat_fix` | `sensor_msgs/msg/NavSatFix` | Keep-last depth 10; packet 20 navigation solution. |
 | `/adnav_node/magnetic_field` | `sensor_msgs/msg/MagneticField` | Keep-last depth 10; raw-sensors packet. |
