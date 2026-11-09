@@ -54,7 +54,7 @@ adnav_node:
       25, 4,    # Velocity Standard Deviation
       26, 4,    # Euler Orientation Standard Deviation -> imu.orientation_covariance/euler_std_dev
       28, 4,    # Raw Sensors (imu_raw, magnetic_field, barometric_pressure, temperature)
-      39, 4,    # Euler Orientation -> imu.orientation (ROS ENU yaw remap)
+      39, 4,    # Euler Orientation -> ENU-world / FLU-body imu.orientation
       42, 4,    # Angular Velocity -> imu.angular_velocity (twist angular velocity source)
       43, 4,    # Angular Acceleration (diagnostic only)
       51, 4,    # Odometer State (external wheel odometer status)

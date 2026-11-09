@@ -27,6 +27,7 @@
  */
 
 #include "adnav_driver.h"
+#include "orientation_conversion.hpp"
 
 #include <cstddef>
 #include <limits>
@@ -997,8 +998,7 @@ void Driver::publishTimerCallback() {
           odometer_state_pub_->publish(odometer_state_msg_);
         }
 
-        RCLCPP_DEBUG(this->get_logger(), "Published updates 0x%08x (cycle %d)",
-                     updates, pub_num_++);
+        RCLCPP_DEBUG(this->get_logger(), "Published updates 0x%08x", updates);
 }
 
 /**
@@ -1928,7 +1928,7 @@ adnav_interfaces::msg::RawAcknowledge Driver::SendInstallationAlignment(
 		installation_alignment_packet.alignment_dcm[2][2] = cp * cr;
 	}
 
-	an_packet_t *	an_packet_t *an_packet = encode_installation_alignment_packet(&installation_alignment_packet);
+	an_packet_t *an_packet = encode_installation_alignment_packet(&installation_alignment_packet);
 	encodeAndSend(an_packet);
 
 	return AcknowledgeHandler();
@@ -2070,6 +2070,9 @@ void Driver::decodePackets(an_decoder_t &an_decoder, const int &bytes) {
 			case packet_id_raw_sensors:
 				rawSensorsRosDecoder(an_packet);
 				break;
+			case packet_id_raw_gnss:
+				rawGnssDecoder(an_packet);
+				break;
 			case packet_id_status:
 				statusRosDecoder(an_packet);
 				break;
@@ -2207,7 +2210,6 @@ void Driver::systemStateRosDecoder(an_packet_t* an_packet) {
   std::unique_lock<std::mutex> lock(messages_mutex_);
   const auto stamp = packet20Time(packet, receipt);
   stampHeader(nav_fix_msg_.header, stamp);
-  stampHeader(twist_msg_.header, stamp);
   switch (packet.filter_status.b.gnss_fix_type) {
   case gnss_fix_2d:
   case gnss_fix_3d:
@@ -2272,9 +2274,7 @@ void Driver::ecefPosRosDecoder(an_packet_t* an_packet) {
   if (decode_ecef_position_packet(&packet, an_packet) != 0) {
     return;
   }
-  const auto stamp = receiptTime();
   std::unique_lock<std::mutex> lock(messages_mutex_);
-  stampHeader(pose_msg_.header, stamp);
   pose_msg_.position.x = packet.position[0];
   pose_msg_.position.y = packet.position[1];
   pose_msg_.position.z = packet.position[2];
@@ -2316,12 +2316,17 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
   imu_raw_msg_.orientation_covariance.fill(-1.0);
   imu_raw_msg_.angular_velocity_covariance.fill(-1.0);
   imu_raw_msg_.linear_acceleration_covariance.fill(-1.0);
-  imu_raw_msg_.linear_acceleration.x = packet.accelerometers[0];
-  imu_raw_msg_.linear_acceleration.y = packet.accelerometers[1];
-  imu_raw_msg_.linear_acceleration.z = packet.accelerometers[2];
-  imu_raw_msg_.angular_velocity.x = packet.gyroscopes[0];
-  imu_raw_msg_.angular_velocity.y = packet.gyroscopes[1];
-  imu_raw_msg_.angular_velocity.z = packet.gyroscopes[2];
+  // Packet 28 is native FRD; publish the state-estimation IMU vectors in FLU.
+  const auto acceleration_flu = frdToFlu(tf2::Vector3(
+      packet.accelerometers[0], packet.accelerometers[1], packet.accelerometers[2]));
+  const auto angular_velocity_flu = frdToFlu(tf2::Vector3(
+      packet.gyroscopes[0], packet.gyroscopes[1], packet.gyroscopes[2]));
+  imu_raw_msg_.linear_acceleration.x = acceleration_flu.x();
+  imu_raw_msg_.linear_acceleration.y = acceleration_flu.y();
+  imu_raw_msg_.linear_acceleration.z = acceleration_flu.z();
+  imu_raw_msg_.angular_velocity.x = angular_velocity_flu.x();
+  imu_raw_msg_.angular_velocity.y = angular_velocity_flu.y();
+  imu_raw_msg_.angular_velocity.z = angular_velocity_flu.z();
 
   stampHeader(baro_msg_.header, stamp);
   baro_msg_.fluid_pressure = packet.pressure;
@@ -2331,6 +2336,108 @@ void Driver::rawSensorsRosDecoder(an_packet_t* an_packet) {
     stampHeader(imu_msg_.header, stamp);
   }
   markUpdate(kPacket28Update);
+}
+
+void Driver::rawGnssDecoder(an_packet_t* an_packet) {
+  raw_gnss_packet_t packet{};
+  if (decode_raw_gnss_packet(&packet, an_packet) != 0) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "Failed to decode ANPP Raw GNSS Packet 29 (length=%u).",
+        static_cast<unsigned int>(an_packet->length));
+    return;
+  }
+
+  const auto fix_type = static_cast<uint8_t>(packet.flags.b.fix_type);
+  const char* fix_type_name = "unknown";
+  switch (fix_type) {
+  case gnss_fix_none:
+    fix_type_name = "no_fix";
+    break;
+  case gnss_fix_2d:
+    fix_type_name = "2D";
+    break;
+  case gnss_fix_3d:
+    fix_type_name = "3D";
+    break;
+  case gnss_fix_sbas:
+    fix_type_name = "SBAS";
+    break;
+  case gnss_fix_differential:
+    fix_type_name = "differential";
+    break;
+  case gnss_fix_omnistar:
+    fix_type_name = "PPP/OmniSTAR";
+    break;
+  case gnss_fix_rtk_float:
+    fix_type_name = "RTK_float";
+    break;
+  case gnss_fix_rtk_fixed:
+    fix_type_name = "RTK_fixed";
+    break;
+  }
+
+  const auto has_status_bit = [&packet](unsigned int bit) {
+    return (packet.flags.r & (1u << bit)) != 0;
+  };
+  const bool antenna1_disconnected = has_status_bit(10);
+  const bool antenna2_disconnected = has_status_bit(11);
+  const bool antenna1_short = has_status_bit(12);
+  const bool antenna2_short = has_status_bit(13);
+  const bool gnss1_failure = has_status_bit(14);
+  const bool gnss2_failure = has_status_bit(15);
+  const bool has_receiver_fault =
+      antenna1_disconnected || antenna2_disconnected || antenna1_short ||
+      antenna2_short || gnss1_failure || gnss2_failure;
+
+  const auto yes_no = [](bool value) { return value ? "yes" : "no"; };
+  RCLCPP_INFO_THROTTLE(
+      this->get_logger(), *this->get_clock(), 1000,
+      "ANPP Packet 29 raw GNSS (receiver point; not lever-arm corrected): "
+      "fix=%s(%u), time=%u.%06u (valid=%s), "
+      "position=(lat=%.8f deg, lon=%.8f deg, height=%.3f m), "
+      "position_std=(lat=%.3f m, lon=%.3f m, height=%.3f m), "
+      "velocity_NED=(N=%.3f, E=%.3f, D=%.3f m/s; valid=%s), "
+      "external_gnss=%s, dual_antenna=(tilt_valid=%s, tilt=%.2f deg +/- "
+      "%.2f deg; heading_valid=%s, heading=%.2f deg +/- %.2f deg; "
+      "floating_ambiguity=%s), antenna1_disconnected=%s, "
+      "antenna2_disconnected=%s, antenna1_short=%s, antenna2_short=%s, "
+      "gnss1_failure=%s, gnss2_failure=%s, raw_status=0x%04X",
+      fix_type_name, static_cast<unsigned int>(fix_type),
+      static_cast<unsigned int>(packet.unix_time_seconds),
+      static_cast<unsigned int>(packet.microseconds),
+      yes_no(packet.flags.b.time_valid),
+      packet.position[0] * RADIANS_TO_DEGREES,
+      packet.position[1] * RADIANS_TO_DEGREES, packet.position[2],
+      packet.position_standard_deviation[0],
+      packet.position_standard_deviation[1],
+      packet.position_standard_deviation[2], packet.velocity[0],
+      packet.velocity[1], packet.velocity[2],
+      yes_no(packet.flags.b.velocity_valid),
+      yes_no(packet.flags.b.external_gnss), yes_no(packet.flags.b.tilt_valid),
+      packet.tilt * RADIANS_TO_DEGREES,
+      packet.tilt_standard_deviation * RADIANS_TO_DEGREES,
+      yes_no(packet.flags.b.heading_valid),
+      packet.heading * RADIANS_TO_DEGREES,
+      packet.heading_standard_deviation * RADIANS_TO_DEGREES,
+      yes_no(has_status_bit(8)), yes_no(antenna1_disconnected),
+      yes_no(antenna2_disconnected), yes_no(antenna1_short),
+      yes_no(antenna2_short), yes_no(gnss1_failure), yes_no(gnss2_failure),
+      static_cast<unsigned int>(packet.flags.r));
+
+  if (fix_type == gnss_fix_none || has_receiver_fault) {
+    RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "ANPP Packet 29 reports GNSS issue: fix=%s(%u), "
+        "antenna1_disconnected=%s, antenna2_disconnected=%s, "
+        "antenna1_short=%s, antenna2_short=%s, gnss1_failure=%s, "
+        "gnss2_failure=%s. Check antenna 1/2 connections and confirm how "
+        "those ports map to the physical antennas.",
+        fix_type_name, static_cast<unsigned int>(fix_type),
+        yes_no(antenna1_disconnected), yes_no(antenna2_disconnected),
+        yes_no(antenna1_short), yes_no(antenna2_short), yes_no(gnss1_failure),
+        yes_no(gnss2_failure));
+  }
 }
 
 void Driver::statusRosDecoder(an_packet_t* an_packet) {
@@ -2564,8 +2671,8 @@ void Driver::eulerOrientationRosDecoder(an_packet_t* an_packet) {
   euler_orientation_msg_.orientation.pitch = packet.orientation[1];
   euler_orientation_msg_.orientation.heading = packet.orientation[2];
 
-  orientation_.setRPY(packet.orientation[0], packet.orientation[1],
-                      M_PI / 2.0 - packet.orientation[2]);
+  orientation_ = nedFrdToEnuFlu(packet.orientation[0], packet.orientation[1],
+                                 packet.orientation[2]);
   if (!std::isfinite(orientation_.x()) || !std::isfinite(orientation_.y()) ||
       !std::isfinite(orientation_.z()) || !std::isfinite(orientation_.w()) ||
       orientation_.length2() <= 1.0e-12) {
@@ -2614,9 +2721,12 @@ void Driver::angularVelRosDecoder(an_packet_t* an_packet) {
   angular_velocity_msg_.angular_velocity.y = packet.angular_velocity[1];
   angular_velocity_msg_.angular_velocity.z = packet.angular_velocity[2];
   stampHeader(imu_msg_.header, stamp);
-  imu_msg_.angular_velocity.x = packet.angular_velocity[0];
-  imu_msg_.angular_velocity.y = packet.angular_velocity[1];
-  imu_msg_.angular_velocity.z = packet.angular_velocity[2];
+  const auto angular_velocity_flu = frdToFlu(tf2::Vector3(
+      packet.angular_velocity[0], packet.angular_velocity[1],
+      packet.angular_velocity[2]));
+  imu_msg_.angular_velocity.x = angular_velocity_flu.x();
+  imu_msg_.angular_velocity.y = angular_velocity_flu.y();
+  imu_msg_.angular_velocity.z = angular_velocity_flu.z();
   markUpdate(kPacket42Update);
 }
 

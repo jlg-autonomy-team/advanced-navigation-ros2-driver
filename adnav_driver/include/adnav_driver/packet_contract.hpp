@@ -34,6 +34,7 @@ inline bool isRosDriverPacketId(int64_t packet_id) {
   case packet_id_quaternion_orientation_standard_deviation:
   case packet_id_euler_orientation_standard_deviation:
   case packet_id_raw_sensors:
+  case packet_id_raw_gnss:
   case packet_id_status:
   case packet_id_position_standard_deviation:
   case packet_id_velocity_standard_deviation:

@@ -31,8 +31,8 @@ The launch profile names the node `adnav_node` (the C++ node's own default name 
 
 | Interface | Type | QoS / details |
 |---|---|---|
-| `/adnav_node/imu` | `sensor_msgs/msg/Imu` | Keep-last depth 10; device orientation/angular-rate values where decoded; covariance `-1` marks unavailable estimates. |
-| `/adnav_node/imu_raw` | `sensor_msgs/msg/Imu` | Keep-last depth 10; raw-sensor packet values. |
+| `/adnav_node/imu` | `sensor_msgs/msg/Imu` | Keep-last depth 10; ENU-world orientation and FLU angular velocity for state estimation; covariance `-1` marks unavailable estimates. |
+| `/adnav_node/imu_raw` | `sensor_msgs/msg/Imu` | Keep-last depth 10; packet-28 acceleration/angular velocity converted from device FRD to FLU; orientation/covariance unknown. |
 | `/adnav_node/nav_sat_fix` | `sensor_msgs/msg/NavSatFix` | Keep-last depth 10; packet 20 navigation solution. |
 | `/adnav_node/magnetic_field` | `sensor_msgs/msg/MagneticField` | Keep-last depth 10; raw-sensors packet. |
 | `/adnav_node/barometric_pressure` | `sensor_msgs/msg/FluidPressure` | Keep-last depth 10. |
@@ -60,6 +60,8 @@ The launch profile names the node `adnav_node` (the C++ node's own default name 
 | `/adnav_node/installation_alignment` | `adnav_interfaces/srv/InstallationAlignment` | Service QoS: default service profile. |
 
 The node also provides standard ROS 2 parameter services. All public parameters are read-only after startup except `read_us`, `publish_us`, `packet_request`, and `packet_timer_period`, which have update callbacks. Defaults below come from the node declaration; the checked-in launch YAML overrides several.
+
+The state-estimation `sensor_msgs/msg/Imu` topics use ROS ENU/FLU conventions: Packet 39 is converted to an ENU-world/FLU-body attitude, and Packet 28 acceleration/angular-rate vectors are converted from the device's FRD axes to FLU. Packet-specific diagnostic topics (including `euler_orientation`, `ned_velocity`, and `body_acceleration`) retain their protocol-native conventions; consumers such as `atlas_ins_odom_bridge` perform any required conversion.
 
 | Parameter | Default | Meaning |
 |---|---:|---|

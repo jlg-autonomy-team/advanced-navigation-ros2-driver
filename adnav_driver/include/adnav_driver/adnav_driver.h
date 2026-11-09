@@ -271,18 +271,6 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
     rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
 
-    // ADV-153 Phase 3: lightweight per-packet raw topic publishers
-    rclcpp::Publisher<adnav_interfaces::msg::PositionStdDev>::SharedPtr        position_std_dev_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::VelocityStdDev>::SharedPtr        velocity_std_dev_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::NedVelocity>::SharedPtr           ned_velocity_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::QuaternionStdDev>::SharedPtr      quaternion_std_dev_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::BodyVelocity>::SharedPtr          body_velocity_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::BodyAcceleration>::SharedPtr      body_acceleration_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::QuaternionOrientation>::SharedPtr quaternion_orientation_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::EulerOrientation>::SharedPtr      euler_orientation_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::AngularVelocity>::SharedPtr       angular_velocity_pub_;
-    rclcpp::Publisher<adnav_interfaces::msg::AngularAcceleration>::SharedPtr   angular_acceleration_pub_;
-
     // ~~~~~~~~~~~~~~~ Callback handles and parameters
     // Callback groups Allows the callbacks to be processed on a different thread by
     // the Multithread executor.
@@ -431,8 +419,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void systemStateRosDecoder(an_packet_t* an_packet);
     void quartOrientSDRosDriver(an_packet_t* an_packet);
     void rawSensorsRosDecoder(an_packet_t* an_packet);
+    void rawGnssDecoder(an_packet_t* an_packet);
 
-    // ADV-153 Phase 3: decoders for packets 23/24/25/26/27/35/38/39/40/42/43
+    // ADV-153 Phase 3: decoders for packets 23/24/25/26/27/29/35/38/39/40/42/43
     void statusRosDecoder(an_packet_t* an_packet);
     void positionStdDevRosDecoder(an_packet_t* an_packet);
     void velocityStdDevRosDecoder(an_packet_t* an_packet);
