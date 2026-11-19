@@ -93,6 +93,8 @@
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/empty.hpp>
 #include <tf2/LinearMath/Quaternion.h>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
 
 #if defined(WIN32) || defined(_WIN32)
     #pragma comment(lib, "ws2_32.lib")  // Winsock Library
@@ -174,6 +176,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
 
     // device communication settings
     std::unique_ptr<adnav::Communicator> communicator_;
+    std::mutex communicator_write_mutex_;
     adnav_connections_data_t comms_data_;
 
     // Packet settings;
@@ -272,6 +275,15 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     double wheel_distance_m_ = 0.0;
     bool have_last_wheel_stamp_ = false;
     rclcpp::Time last_wheel_stamp_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr local_odom_sub_;
+    std::unique_ptr<tf2_ros::Buffer> local_velocity_tf_buffer_;
+    std::unique_ptr<tf2_ros::TransformListener> local_velocity_tf_listener_;
+    std::string local_velocity_sensor_frame_;
+    double local_velocity_maximum_age_s_ = 0.2;
+    double local_velocity_minimum_standard_deviation_m_s_ = 0.0;
+    double local_velocity_standard_deviation_scale_ = 1.0;
+    bool have_last_local_velocity_stamp_ = false;
+    rclcpp::Time last_local_velocity_stamp_;
 
     // Timers
     rclcpp::TimerBase::SharedPtr publish_timer_;
@@ -322,6 +334,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void recievePackets();
     void publishTimerCallback();
     void wheelOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
+    void localOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg);
     void RestartPublisher();
     void RestartReader();
 

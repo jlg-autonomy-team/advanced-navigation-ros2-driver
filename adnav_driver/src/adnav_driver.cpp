@@ -29,6 +29,9 @@
 #include "adnav_driver.h"
 
 #include <limits>
+#include <tf2/LinearMath/Matrix3x3.h>
+#include <tf2/LinearMath/Vector3.h>
+#include <tf2/exceptions.h>
 
 namespace adnav {
 
@@ -314,17 +317,45 @@ void Driver::createSubscriptions() {
       "Odometry topic forwarded to the INS as external odometer packets. Empty disables.";
   this->declare_parameter<std::string>("wheel_odom_topic", "odometry/wheel", topic_description);
   const std::string topic = this->get_parameter("wheel_odom_topic").as_string();
-  if (topic.empty()) {
-    return;
-  }
-
   // Shares the service group so device writes are serialized with service writes.
   rclcpp::SubscriptionOptions options;
   options.callback_group = service_group_;
-  wheel_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-      topic, 10,
-      std::bind(&Driver::wheelOdomCallback, this, std::placeholders::_1),
-      options);
+  if (!topic.empty()) {
+    wheel_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        topic, 10,
+        std::bind(&Driver::wheelOdomCallback, this, std::placeholders::_1),
+        options);
+  }
+  rcl_interfaces::msg::ParameterDescriptor local_velocity_descriptor;
+  local_velocity_descriptor.read_only = true;
+  const auto local_topic = this->declare_parameter<std::string>(
+      "local_velocity_odom_topic", "", local_velocity_descriptor);
+  local_velocity_sensor_frame_ =
+      this->declare_parameter<std::string>(
+          "local_velocity_sensor_frame", "imu_link", local_velocity_descriptor);
+  local_velocity_maximum_age_s_ =
+      this->declare_parameter<double>("local_velocity_maximum_age_s", 0.2, local_velocity_descriptor);
+  local_velocity_minimum_standard_deviation_m_s_ = this->declare_parameter<double>(
+      "local_velocity_minimum_standard_deviation_m_s", 0.1, local_velocity_descriptor);
+  local_velocity_standard_deviation_scale_ =
+      this->declare_parameter<double>(
+          "local_velocity_standard_deviation_scale", 1.0, local_velocity_descriptor);
+  if (local_velocity_sensor_frame_.empty() ||
+      !std::isfinite(local_velocity_maximum_age_s_) || local_velocity_maximum_age_s_ <= 0.0 ||
+      !std::isfinite(local_velocity_minimum_standard_deviation_m_s_) ||
+      local_velocity_minimum_standard_deviation_m_s_ <= 0.0 ||
+      !std::isfinite(local_velocity_standard_deviation_scale_) ||
+      local_velocity_standard_deviation_scale_ < 1.0) {
+    throw std::invalid_argument("Invalid local velocity aiding parameters");
+  }
+  if (!local_topic.empty()) {
+    local_velocity_tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+    local_velocity_tf_listener_ =
+        std::make_unique<tf2_ros::TransformListener>(*local_velocity_tf_buffer_);
+    local_odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+        local_topic, 10,
+        std::bind(&Driver::localOdomCallback, this, std::placeholders::_1), options);
+  }
 }
 
 /**
@@ -359,6 +390,149 @@ void Driver::wheelOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     return;
   }
   encodeAndSend(an_packet);
+}
+
+void Driver::localOdomCallback(const nav_msgs::msg::Odometry::SharedPtr msg) {
+  const rclcpp::Time stamp(msg->header.stamp, this->get_clock()->get_clock_type());
+  const double age_s = (this->get_clock()->now() - stamp).seconds();
+  if (stamp.nanoseconds() <= 0 || !std::isfinite(age_s) || age_s < 0.0 ||
+      age_s > local_velocity_maximum_age_s_ ||
+      (have_last_local_velocity_stamp_ && stamp <= last_local_velocity_stamp_) ||
+      msg->child_frame_id.empty()) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Local velocity aiding rejected an invalid, stale or repeated odometry stamp or frame");
+    return;
+  }
+  const auto &twist = msg->twist.twist;
+  const double components[6] = {twist.linear.x, twist.linear.y, twist.linear.z,
+                                twist.angular.x, twist.angular.y, twist.angular.z};
+  for (const double component : components) {
+    if (!std::isfinite(component)) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Local velocity aiding rejected nonfinite twist");
+      return;
+    }
+  }
+  const auto &covariance = msg->twist.covariance;
+  for (int row = 0; row < 6; ++row) {
+    if (!std::isfinite(covariance[row * 6 + row]) || covariance[row * 6 + row] <= 0.0) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Local velocity aiding requires positive finite twist variances");
+      return;
+    }
+    for (int column = 0; column < 6; ++column) {
+      if (!std::isfinite(covariance[row * 6 + column]) ||
+          std::abs(covariance[row * 6 + column] - covariance[column * 6 + row]) > 1e-8) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Local velocity aiding rejected invalid twist covariance");
+        return;
+      }
+    }
+    double covariance_factor[6][6]{};
+    for (int row = 0; row < 6; ++row) {
+      for (int column = 0; column <= row; ++column) {
+        double value = covariance[row * 6 + column];
+        for (int index = 0; index < column; ++index) {
+          value -= covariance_factor[row][index] * covariance_factor[column][index];
+        }
+        if (!std::isfinite(value) || (row == column && value <= 0.0)) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                               "Local velocity aiding requires positive-definite twist covariance");
+          return;
+        }
+        covariance_factor[row][column] = row == column ? std::sqrt(value) :
+            value / covariance_factor[column][column];
+      }
+    }
+  }
+  geometry_msgs::msg::TransformStamped sensor_from_odometry_child;
+  try {
+    sensor_from_odometry_child = local_velocity_tf_buffer_->lookupTransform(
+        local_velocity_sensor_frame_, msg->child_frame_id, stamp);
+  } catch (const tf2::TransformException &error) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Local velocity aiding cannot transform odometry twist: %s", error.what());
+    return;
+  }
+  const auto &transform = sensor_from_odometry_child.transform;
+  const tf2::Quaternion rotation(transform.rotation.x, transform.rotation.y,
+                                 transform.rotation.z, transform.rotation.w);
+  const tf2::Vector3 sensor_to_child_m(transform.translation.x, transform.translation.y,
+                                       transform.translation.z);
+  if (!std::isfinite(rotation.length2()) || std::abs(rotation.length2() - 1.0) > 1e-3 ||
+      !std::isfinite(sensor_to_child_m.x()) || !std::isfinite(sensor_to_child_m.y()) ||
+      !std::isfinite(sensor_to_child_m.z())) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Local velocity aiding rejected an invalid transform");
+    return;
+  }
+  const tf2::Matrix3x3 sensor_from_child(rotation);
+  double jacobian[3][6]{};
+  for (int axis = 0; axis < 3; ++axis) {
+    tf2::Vector3 basis(0.0, 0.0, 0.0);
+    basis[axis] = 1.0;
+    const auto rotated = sensor_from_child * basis;
+    const auto angular_contribution = -rotated.cross(sensor_to_child_m);
+    for (int row = 0; row < 3; ++row) {
+      jacobian[row][axis] = rotated[row];
+      jacobian[row][axis + 3] = angular_contribution[row];
+    }
+  }
+  double velocity_sensor[3]{};
+  double velocity_covariance_sensor[3][3]{};
+  for (int row = 0; row < 3; ++row) {
+    for (int axis = 0; axis < 6; ++axis) {
+      velocity_sensor[row] += jacobian[row][axis] * components[axis];
+      for (int column = 0; column < 3; ++column) {
+        for (int other_axis = 0; other_axis < 6; ++other_axis) {
+          velocity_covariance_sensor[row][column] += jacobian[row][axis] *
+              covariance[axis * 6 + other_axis] * jacobian[column][other_axis];
+        }
+      }
+    }
+  }
+  double variance_upper_bound = 0.0;
+  for (int row = 0; row < 3; ++row) {
+    double row_sum = 0.0;
+    for (int column = 0; column < 3; ++column) {
+      if (!std::isfinite(velocity_covariance_sensor[row][column])) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                             "Local velocity aiding rejected invalid transformed covariance");
+        return;
+      }
+      row_sum += std::abs(velocity_covariance_sensor[row][column]);
+    }
+    variance_upper_bound = std::max(variance_upper_bound, row_sum);
+  }
+  const double standard_deviation_m_s = std::max(
+      local_velocity_minimum_standard_deviation_m_s_,
+      std::sqrt(variance_upper_bound) * local_velocity_standard_deviation_scale_);
+  if (!std::isfinite(standard_deviation_m_s) ||
+      standard_deviation_m_s > std::numeric_limits<float>::max()) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Local velocity aiding rejected invalid transformed covariance");
+    return;
+  }
+  external_body_velocity_packet_t packet{};
+  for (int axis = 0; axis < 3; ++axis) {
+    const double velocity_m_s = axis == 0 ? velocity_sensor[axis] : -velocity_sensor[axis];
+    if (!std::isfinite(velocity_m_s) || std::abs(velocity_m_s) > std::numeric_limits<float>::max()) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                           "Local velocity aiding rejected out-of-range transformed velocity");
+      return;
+    }
+    packet.velocity[axis] = static_cast<float>(velocity_m_s);
+  }
+  packet.standard_deviation = static_cast<float>(standard_deviation_m_s);
+  an_packet_t *an_packet = encode_external_body_velocity_packet(&packet);
+  if (an_packet == nullptr) {
+    RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                         "Failed to allocate external body velocity packet");
+    return;
+  }
+  encodeAndSend(an_packet);
+  last_local_velocity_stamp_ = stamp;
+  have_last_local_velocity_stamp_ = true;
 }
 
 /**
@@ -1643,7 +1817,14 @@ void Driver::NtripReceiveFunction(const char* buffer, int size) {
 void Driver::encodeAndSend(an_packet_t* an_packet) {
 	an_packet_encode(an_packet);
 	// Send encoded packet through the selected communication medium
-	communicator_->write(an_packet_pointer(an_packet), an_packet_size(an_packet));
+	const auto packet_size = an_packet_size(an_packet);
+	{
+		std::lock_guard<std::mutex> lock(communicator_write_mutex_);
+		const int bytes_written = communicator_->write(an_packet_pointer(an_packet), packet_size);
+		if (bytes_written < 0 || static_cast<std::size_t>(bytes_written) != packet_size) {
+			RCLCPP_ERROR(this->get_logger(), "Failed to write a complete ANPP packet");
+		}
+	}
 	// Free the packet to avoid memory leaks
 	an_packet_free(&an_packet);
 }

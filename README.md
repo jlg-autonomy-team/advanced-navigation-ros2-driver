@@ -58,8 +58,10 @@ The launch profile names the node `adnav_node` (the C++ node's own default name 
 | `/adnav_node/request_packet` | `adnav_interfaces/srv/RequestPackets` | Service QoS: default service profile. |
 | `/adnav_node/ntrip` | `adnav_interfaces/srv/Ntrip` | Service QoS: default service profile. Credentials are request fields, not launch YAML defaults. |
 | `/adnav_node/installation_alignment` | `adnav_interfaces/srv/InstallationAlignment` | Service QoS: default service profile. |
+| `odometry/wheel` | `nav_msgs/msg/Odometry` | Subscription; forwarded as an external odometer packet unless disabled. |
+| Local odometry topic | `nav_msgs/msg/Odometry` | Optional subscription; forwarded as external body velocity when configured. |
 
-The node also provides standard ROS 2 parameter services. All public parameters are read-only after startup except `read_us`, `publish_us`, `packet_request`, and `packet_timer_period`, which have update callbacks. Defaults below come from the node declaration; the checked-in launch YAML overrides several.
+The node also provides standard ROS 2 parameter services. `read_us`, `publish_us`, `packet_request`, and `packet_timer_period` have update callbacks. The wheel topic is read at startup; changing it later does not change the subscription. The local velocity aiding parameters are read-only after startup. Defaults below come from the node declaration; the checked-in launch YAML overrides several.
 
 | Parameter | Default | Meaning |
 |---|---:|---|
@@ -73,13 +75,27 @@ The node also provides standard ROS 2 parameter services. All public parameters 
 | `port` | `0` | IP endpoint port. |
 | `log_path` | `~/.ros/log/` | Path used for driver log files. |
 | `comm_select` | `0` | Transport: 0 serial, 1 TCP client, 2 TCP server, 3 UDP, 4 CAN (not supported by this build). |
+| `wheel_odom_topic` | `odometry/wheel` | Wheel-odometry input; an empty string disables forwarding. |
+| `local_velocity_odom_topic` | `""` | Local-odometry input; an empty string disables external body-velocity forwarding. |
+| `local_velocity_sensor_frame` | `imu_link` | Frame whose origin and axes are used for external body velocity. |
+| `local_velocity_maximum_age_s` | `0.2` | Maximum age in seconds from the odometry header stamp to driver receipt. |
+| `local_velocity_minimum_standard_deviation_m_s` | `0.1` | Lower bound in metres per second on the packet's common velocity standard deviation. |
+| `local_velocity_standard_deviation_scale` | `1.0` | Multiplier of the covariance-derived standard deviation; must be at least one. |
 
 The supplied serial YAML sets `publish_us=20000`, `read_us=1000`, `comm_select=0`, `baud_rate=1000000`, `com_port=ttyUSB0`, and packet timer 5000 µs, with its own packet request list. Check the selected YAML before relying on parameter defaults.
+
+### Local velocity aiding
+
+The optional subscription sends one [external body velocity packet](https://docs.advancednavigation.com/certus-mini/ANPP/ExtBodyVelocityPacket.htm) per accepted local-odometry sample, alongside the existing wheel-odometer packets. The odometry twist and its covariance are transformed from the message child frame to velocity at the `local_velocity_sensor_frame` origin. Angular velocity is used for this rigid-body origin shift; the packet carries only linear velocity, not an angular-velocity measurement. The packet axes are the configured sensor frame's forward-right-down axes: ROS X is unchanged, and ROS Y and Z are negated.
+
+This assumes the INS external body-velocity position and orientation offsets are zero and its body axes correspond to `imu_link` after the ROS-to-device axis conversion. The device installation alignment and physical mounting must be consistent with that assumption; this driver neither reads nor changes the persisted offsets. Packet 47 has no sample timestamp or delay field, so the age limit rejects old samples but does not compensate transport delay. Missing transforms, invalid or non-positive-definite covariance, future, stale, repeated and out-of-order samples are rejected with throttled warnings. Restart the driver after a backward clock jump.
+
+The packet uses one common standard deviation, conservatively bounded from the transformed covariance and subject to the configured minimum and scale. The local estimate and INS can share wheel and raw IMU inputs, so their errors are correlated; the minimum and scale are not a guarantee of statistical independence. Confirm the device reports that both aiding sources are received and used before relying on this input. Set `local_velocity_odom_topic` to an empty string at startup to disable this path without disabling wheel odometry.
 
 ## Prerequisites
 
 - ROS 2 Jazzy on Ubuntu 24.04 and a C++ build toolchain (`colcon`, CMake, and the ROS 2 development packages).
-- `adnav_driver/package.xml` dependencies: `rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`, `tf2`, `std_srvs`, `adnav_interfaces`; testing uses `ament_lint_common`.
+- `adnav_driver/package.xml` dependencies include `rclcpp`, `std_msgs`, `sensor_msgs`, `geometry_msgs`, `nav_msgs`, `tf2`, `tf2_ros`, `std_srvs`, and `adnav_interfaces`; testing uses `ament_lint_common`.
 - Build the sibling `adnav_interfaces` package as part of this submodule. Its generated interfaces use the message/service definitions in the vendored `an-ros-common` checkout.
 - Device access and a compatible serial/network connection for hardware operation.
 
