@@ -90,6 +90,11 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_packet_contract test/test_packet_contract.cpp)
   target_include_directories(test_packet_contract PRIVATE include ../an-ros-common/include)
+  ament_add_gtest(test_packet_stream
+    test/test_packet_stream.cpp
+    ../an-ros-common/src/an_packet_protocol.c
+  )
+  target_include_directories(test_packet_stream PRIVATE ../an-ros-common/include)
 endif()
 
 ament_export_include_directories(include)

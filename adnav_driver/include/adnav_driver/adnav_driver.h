@@ -162,6 +162,8 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     ~Driver();
 
  private:
+    an_decoder_t receive_decoder_{};
+
     // Debug variables
     int pub_num_ = 0, P28_num_ = 0, P20_num_ = 0, P27_num_ = 0, P33_num_ = 0, P0_num_ = 0;
 

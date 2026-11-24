@@ -63,6 +63,7 @@ bool standardDeviationToVariance(double standard_deviation, double &variance) {
  * the device.
  */
 Driver::Driver() : rclcpp::Node("adnav_driver") {
+  an_decoder_initialise(&receive_decoder_);
   // Set default values
   memset(&acknowledge_packet_, -1, sizeof(acknowledge_packet_));
 
@@ -162,10 +163,8 @@ Driver::~Driver() {
  * with a clear error so the caller (the constructor) fails fast and loud instead of hanging.
  */
 void Driver::waitForDevicePacket() {
-	// initialize the decoder.
-	an_decoder_t an_decoder;
+	auto &an_decoder = receive_decoder_;
 	an_packet_t *an_packet;
-	an_decoder_initialise(&an_decoder);
 	bool recieved = false;
 	int bytes_received;
 
@@ -640,8 +639,7 @@ void Driver::deviceSetup() {
  * @param label human-readable name of the config just sent, for the log message.
  */
 void Driver::pumpAndLogAcknowledge(const std::string& label) {
-	an_decoder_t an_decoder;
-	an_decoder_initialise(&an_decoder);
+	auto &an_decoder = receive_decoder_;
 	acknowledge_recieve_ = false;
 
 	const auto start = std::chrono::steady_clock::now();
@@ -931,9 +929,7 @@ void Driver::setupParams() {
  * This Function will also create a log file session and log incoming data to it.
  */
 void Driver::recievePackets() {
-	// initialize the decoder.
-	an_decoder_t an_decoder;
-	an_decoder_initialise(&an_decoder);
+	auto &an_decoder = receive_decoder_;
 	int bytes_received;
 
 	// get the bytes from the communication method, and load them into the decoder

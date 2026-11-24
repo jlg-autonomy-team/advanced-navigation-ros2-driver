@@ -82,7 +82,12 @@ The node also provides standard ROS 2 parameter services. `read_us`, `publish_us
 | `local_velocity_minimum_standard_deviation_m_s` | `0.1` | Lower bound in metres per second on the packet's common velocity standard deviation. |
 | `local_velocity_standard_deviation_scale` | `1.0` | Multiplier of the covariance-derived standard deviation; must be at least one. |
 
-The supplied serial YAML sets `publish_us=20000`, `read_us=1000`, `comm_select=0`, `baud_rate=1000000`, `com_port=ttyUSB0`, and packet timer 5000 µs, with its own packet request list. Check the selected YAML before relying on parameter defaults.
+The supplied serial YAML sets `publish_us=33333` (approximately 30 publication callbacks per second), `read_us=5000` (200 read callbacks per second), `comm_select=0`, `baud_rate=1000000`, `com_port=ttyUSB0`, and packet timer 5000 µs, with its own packet request list. Device packet output remains nominally 50 Hz per requested type; publication coalesces pending updates rather than forwarding every sample. Check the selected YAML before relying on parameter defaults.
+
+The receive decoder retains incomplete packets across startup and normal reads.
+The built-in NTRIP receive thread sleeps for 1 ms only when its nonblocking socket
+reports no available data; successful reads and error handling retain their existing paths.
+This backoff can add scheduling-dependent correction delivery delay and is not a hard latency bound.
 
 ### Local velocity aiding
 
