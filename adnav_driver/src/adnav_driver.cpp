@@ -609,7 +609,7 @@ void Driver::deviceSetup() {
 	// packet_timer_period=1000 was silently REJECTED (Acknowledge result=3/failure_range) for
 	// most of a session before anyone noticed, purely because nothing ever checked. Manually pump
 	// a short, bounded read/decode loop here instead to actually catch and log the real result.
-	pumpAndLogAcknowledge("Packet Timer Period");
+	pumpAndLogAcknowledge("Packet Timer Period", packet_id_packet_timer_period);
 
 	// Create and fill a periods format.
 	std::vector<adnav_interfaces::msg::PacketPeriod> packet_periods;
@@ -623,7 +623,7 @@ void Driver::deviceSetup() {
 	// Since we are not waiting for device acknowledgement at startup
 	acknowledge_recieve_ = true;
 	(void)SendPacketPeriods(packet_periods); // Will overwrite acknowledge_receive_ to false.
-	pumpAndLogAcknowledge("Packet Periods");
+	pumpAndLogAcknowledge("Packet Periods", packet_id_packet_periods);
 }
 
 /**
@@ -637,8 +637,9 @@ void Driver::deviceSetup() {
  * so the check-and-log logic here doesn't have to duplicate any ANPP parsing.
  *
  * @param label human-readable name of the config just sent, for the log message.
+ * @param expected_acknowledged_packet_id ANPP packet ID of the config, used to match a late Acknowledge Packet.
  */
-void Driver::pumpAndLogAcknowledge(const std::string& label) {
+void Driver::pumpAndLogAcknowledge(const std::string& label, uint8_t expected_acknowledged_packet_id) {
 	auto &an_decoder = receive_decoder_;
 	acknowledge_recieve_ = false;
 
@@ -656,8 +657,12 @@ void Driver::pumpAndLogAcknowledge(const std::string& label) {
 	}
 
 	if (!acknowledge_recieve_) {
-		RCLCPP_WARN(this->get_logger(), "%s: no Acknowledge Packet received within 500ms of sending.",
-			label.c_str());
+		{
+			std::unique_lock<std::mutex> lock(acknowledge_mutex_);
+			startup_acknowledges_awaiting_late_reply_[expected_acknowledged_packet_id] = label;
+		}
+		RCLCPP_WARN(this->get_logger(), "%s: no Acknowledge Packet received within 500ms of sending. "
+			"The driver will log its result if it arrives later.", label.c_str());
 		return;
 	}
 	if (acknowledge_packet_.acknowledge_result == acknowledge_success) {
@@ -2112,6 +2117,22 @@ void Driver::acknowledgeDecoder(an_packet_t* an_packet) {
 
 	RCLCPP_DEBUG(this->get_logger(), "acknowledgement received.\nID: %d\nResult: %d\n",
 		acknowledge_packet_.packet_id, acknowledge_packet_.acknowledge_result);
+
+	// Report the result of a startup config whose Acknowledge Packet missed the startup wait.
+	auto late_reply = startup_acknowledges_awaiting_late_reply_.find(acknowledge_packet_.packet_id);
+	if (late_reply != startup_acknowledges_awaiting_late_reply_.end()) {
+		if (acknowledge_packet_.acknowledge_result == acknowledge_success) {
+			RCLCPP_INFO(this->get_logger(),
+				"%s: Acknowledge Packet arrived after the startup wait and was accepted by device.",
+				late_reply->second.c_str());
+		} else {
+			RCLCPP_ERROR(this->get_logger(),
+				"%s: Acknowledge Packet arrived after the startup wait and was REJECTED by device "
+				"(Acknowledge result=%d - see acknowledge_result_e in ins_packets.h).",
+				late_reply->second.c_str(), acknowledge_packet_.acknowledge_result);
+		}
+		startup_acknowledges_awaiting_late_reply_.erase(late_reply);
+	}
 
 	// Set the acknowledgement received to true
 	acknowledge_recieve_ = true;

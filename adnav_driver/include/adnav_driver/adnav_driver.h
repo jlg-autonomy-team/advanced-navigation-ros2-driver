@@ -41,6 +41,7 @@
 #include <memory>       // smart pointers
 #include <vector>       // std::vector
 #include <string>       // std::string
+#include <map>           // std::map
 #include <mutex>        // std::mutex, std:unique_lock
 #include <condition_variable>   // std::condition_variable
 
@@ -311,6 +312,9 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     std::mutex acknowledge_mutex_;
     std::condition_variable srv_cv_;
     bool acknowledge_recieve_;
+    // Startup configs whose Acknowledge Packet missed the startup wait, keyed by acknowledged packet ID.
+    // Only access with protection of acknowledge_mutex_.
+    std::map<uint8_t, std::string> startup_acknowledges_awaiting_late_reply_;
 
     // NTRIP Variables
     std::unique_ptr<adnav::ntrip::Client> ntrip_client_;
@@ -328,7 +332,7 @@ class Driver : public rclcpp::Node  // Inheriting gives every "this->" as a poin
     void createSubscriptions();
     void createServices();
     void deviceSetup();
-    void pumpAndLogAcknowledge(const std::string& label);
+    void pumpAndLogAcknowledge(const std::string& label, uint8_t expected_acknowledged_packet_id);
     void setupParamService();
     void setupParams();
 
